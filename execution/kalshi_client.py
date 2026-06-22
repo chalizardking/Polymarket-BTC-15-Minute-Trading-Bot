@@ -91,7 +91,7 @@ class KalshiClient:
         self.session.headers.update({"Accept": "application/json"})
 
         mode = "DEMO" if demo else "PRODUCTION"
-        logger.info(f"Initialized Kalshi Client [{mode}]")
+        logger.info(f"Initialized Kalshi Client (Kalshi Kush) [{mode}]")
 
     # ------------------------------------------------------------------
     # Signing

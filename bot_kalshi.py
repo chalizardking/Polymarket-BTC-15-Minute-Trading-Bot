@@ -1,7 +1,7 @@
 """
-Kalshi BTC 15-Minute Trading Bot (Main Runner)
+Kalshi Kush BTC 15-Minute Trading Bot (Main Runner)
 
-This is the Kalshi-native equivalent of bot.py.
+This is the Kalshi-native equivalent of bot.py (branded as Kalshi Kush).
 It reuses the exact same:
   - signal processors (spike, sentiment, divergence, orderbook, tick velocity, PCR)
   - fusion engine
@@ -11,7 +11,7 @@ It reuses the exact same:
   - paper trading recorder
 
 Key differences from the Polymarket version:
-- Uses KalshiClient + KalshiBTCIntegration instead of Nautilus
+- Uses KalshiClient + KalshiBTCIntegration (Kalshi Kush) instead of Nautilus
 - Prices are in decimal dollars ("0.6500")
 - Orders use bid/ask + client_order_id
 - Market discovery is done via Kalshi series (KXBTC15M)
@@ -196,10 +196,11 @@ class KalshiBTC15MinStrategy:
             logger.warning("=" * 80)
 
         logger.info("=" * 80)
-        logger.info("KALSHI BTC 15-MIN STRATEGY INITIALIZED")
+        logger.info("KALSHI KUSH BTC 15-MIN STRATEGY INITIALIZED")
         logger.info(f"  Simulation: {simulation_mode}")
         logger.info("  Fixed $1 per trade")
         logger.info("  Late window trading (13-14 min into each 15-min market)")
+        logger.info("  Brand: Kalshi Kush")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -227,7 +228,7 @@ class KalshiBTC15MinStrategy:
 
     async def start(self) -> bool:
         logger.info("=" * 80)
-        logger.info("STARTING KALSHI BTC 15-MIN BOT")
+        logger.info("STARTING KALSHI KUSH BTC 15-MIN BOT")
         logger.info("=" * 80)
 
         ok = await self.integration.start()
@@ -527,7 +528,7 @@ class KalshiBTC15MinStrategy:
         self.paper_trades.append(pt)
 
         self.performance_tracker.record_trade(
-            trade_id=f"kalshi_paper_{int(time.time())}",
+            trade_id=f"kalshi_kush_paper_{int(time.time())}",
             direction=direction,
             entry_price=price,
             exit_price=exit_p,
@@ -540,7 +541,7 @@ class KalshiBTC15MinStrategy:
         )
 
         logger.info("=" * 80)
-        logger.info("[SIMULATION] PAPER TRADE on Kalshi")
+        logger.info("[SIMULATION] PAPER TRADE on Kalshi Kush")
         logger.info(f"  Direction: {direction.upper()}")
         logger.info(f"  Size: ${float(size):.2f}")
         logger.info(f"  Entry: ${float(price):.4f} → Exit: ${float(exit_p):.4f}")
@@ -553,7 +554,7 @@ class KalshiBTC15MinStrategy:
     def _save_paper_trades(self):
         import json
         try:
-            with open("kalshi_paper_trades.json", "w") as f:
+            with open("kalshi_kush_paper_trades.json", "w") as f:
                 json.dump([t.to_dict() for t in self.paper_trades], f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save paper trades: {e}")
@@ -589,7 +590,7 @@ class KalshiBTC15MinStrategy:
 async def run_kalshi_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False):
     mode_str = "LIVE" if not simulation else "SIMULATION"
     print("=" * 80)
-    print("KALSHI BTC 15-MIN TRADING BOT")
+    print("KALSHI KUSH BTC 15-MIN TRADING BOT")
     print(f"Mode: {mode_str}")
     print("=" * 80)
 

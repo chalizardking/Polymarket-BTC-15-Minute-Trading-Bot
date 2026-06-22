@@ -26,7 +26,8 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
 - [Contributing](#contributing)
 - [FAQ](#faq)
 - [License](#license)
-- [Disclaimer](#disclaimer)
+- [Kalshi Kush](#kalshi-kush)
+- [Disclaimer](#disclaimer) 
 
 ---
 
@@ -291,9 +292,177 @@ However, **past performance does not guarantee future results**. Always test tho
 - **Normal mode** — trades every 15 minutes (matches the intended 15-minute strategy timeframe)
 
  
-## Disclaimer
-TRADING CRYPTOCURRENCIES CARRIES SIGNIFICANT RISK.
+## Kalshi Kush (BTC 15-Minute Bot)
 
+**Kalshi Kush** is the Kalshi-native implementation of the 15-minute BTC trading strategy.
+
+It reuses the **exact same** signal processors, fusion engine, risk engine, late-window logic, trend filter, performance tracking, and Grafana exporter as the Polymarket version. Only the market access and execution layer are different.
+
+"Kush" branding: friendly name for the Kalshi version of this bot.
+
+### Key Differences vs Polymarket Version
+
+| Aspect                  | Polymarket Version              | Kalshi Kush Version                     |
+|-------------------------|---------------------------------|-----------------------------------------|
+| Market Access           | NautilusTrader + Polymarket CLOB| Direct REST (RSA-PSS auth)              |
+| Markets                 | Polymarket BTC 15m events       | Kalshi `KXBTC15M` series (Kalshi Kush)  |
+| Pricing                 | USDC / shares                   | Decimal dollars (e.g. `0.6500`)         |
+| Order Style             | Polymarket order types          | `bid`/`ask` with `client_order_id`      |
+| Framework               | Heavy Nautilus integration      | Lightweight integration layer           |
+| Auth                    | Polymarket signer               | RSA-PSS signature over timestamp+path   |
+
+### Features
+
+- Branded as **Kalshi Kush**
+- 100% reuse of proven signal brain (Spike, Sentiment, Divergence, OrderBook, TickVelocity, DeribitPCR)
+- Fixed $1 position sizing (safety-first)
+- Late-window execution (trades only in minute 13–14 of each 15-min interval)
+- Trend filter (>60% = long / <40% = short)
+- Full paper trading + live execution toggle
+- Comprehensive logging with `[SIM]` / `[LIVE]` prefixes
+- Same monitoring stack (Grafana, performance tracker)
+
+### Prerequisites
+
+- Python 3.14+
+- Redis (optional but recommended for mode switching)
+- Kalshi account with trading enabled
+- Kalshi API credentials:
+  - `KALSHI_KEY_ID`
+  - RSA private key (PEM format)
+- Packages: `requests`, `cryptography`
+
+Runs under the Kalshi Kush brand.
+
+### Quick Start
+
+#### 1. Configure Environment
+
+```bash
+cp .env.kalshi.example .env
+```
+
+Edit `.env`:
+
+```env
+# Kalshi Authentication
+KALSHI_KEY_ID=your-api-key-id
+KALSHI_PRIVATE_KEY_PATH=~/.kalshi/private_key.pem
+
+# Start in demo (strongly recommended)
+KALSHI_DEMO=true
+
+# Optional Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=2
+```
+
+#### 2. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+pip install requests cryptography
+```
+
+#### 3. Run the Bot
+
+```bash
+# Paper trading (simulation) - safe default
+python bot_kalshi.py
+
+# Fast testing: trade every minute
+python bot_kalshi.py --test-mode
+
+# LIVE trading on real Kalshi (REAL MONEY)
+python bot_kalshi.py --live
+
+# Force demo environment even if KALSHI_DEMO=false
+python bot_kalshi.py --demo
+
+# Disable Grafana exporter
+python bot_kalshi.py --no-grafana
+```
+
+### Configuration Reference
+
+| Variable                    | Required | Description                                      | Example                     |
+|-----------------------------|----------|--------------------------------------------------|-----------------------------|
+| `KALSHI_KEY_ID`             | Yes      | Your Kalshi API key ID                           | `abc123...`                 |
+| `KALSHI_PRIVATE_KEY_PATH`   | Yes*     | Path to RSA private key (PEM)                    | `~/.kalshi/key.pem`         |
+| `KALSHI_PRIVATE_KEY`        | Yes*     | Raw PEM content (alternative to path)            | `-----BEGIN PRIVATE KEY-... |
+| `KALSHI_DEMO`               | No       | `true` = demo-api, `false` = production          | `true`                      |
+| `REDIS_HOST` / `PORT` / `DB`| No       | Redis for runtime control                        | `localhost`, `6379`, `2`    |
+
+*Provide either `KALSHI_PRIVATE_KEY_PATH` or `KALSHI_PRIVATE_KEY`.
+
+**Position size**: Hard-coded to $1.00 per trade (same philosophy as Polymarket bot).
+
+### How It Works
+
+1. On startup the bot discovers the current active `KXBTC15M` market via `/markets`.
+2. A polling price feed pulls the order book every ~1s and feeds mid prices into the shared signal processors.
+3. Between 780–840 seconds into the 15-min interval the bot evaluates fused signals + trend filter.
+4. If all gates pass, it submits a `bid` (buy YES) or `ask` (buy NO) order for $1 notional.
+5. Paper mode records simulated outcomes; live mode calls `create_order` on Kalshi.
+
+### Paper Trading
+
+Paper trades are saved to `kalshi_kush_paper_trades.json` (Kalshi Kush).
+View them with:
+
+```bash
+python view_paper_trades.py   # (may need minor adaptation for Kalshi Kush trades)
+# or just inspect the JSON
+cat kalshi_kush_paper_trades.json
+```
+
+### Live Trading Warnings
+
+- Start with `KALSHI_DEMO=true`
+- Monitor the first few cycles closely
+- The bot uses `immediate_or_cancel` + `taker_at_cross` by default
+- All orders include a unique `client_order_id` for idempotency
+- Never share or commit your private key
+
+### Testing the Kalshi Modules
+
+```bash
+pip install -r requirements-test.txt
+pytest tests/ -v
+```
+
+The test suite covers:
+- `KalshiClient` (auth headers, signing, order payload, market discovery)
+- `KalshiBTCIntegration` (Kalshi Kush integration)
+- All six signal processors with synthetic data
+
+### File Layout (Kalshi Kush)
+
+```
+.
+├── bot_kalshi.py                 # Main Kalshi Kush runner
+├── execution/
+│   ├── kalshi_client.py          # RSA-PSS REST client (Kalshi Kush)
+│   ├── kalshi_integration.py     # Kalshi Kush: market discovery + price feed + place_trade
+├── tests/
+│   ├── test_kalshi_client.py
+│   ├── test_kalshi_integration.py
+│   ├── test_signal_processors.py
+├── requirements-test.txt
+└── .env.kalshi.example
+```
+
+### Switching Between Bots
+
+- Polymarket: `python 15m_bot_runner.py` or `bot.py`
+- **Kalshi Kush**: `python bot_kalshi.py`
+
+They share `core/strategy_brain/`, `execution/risk_engine.py`, `monitoring/`, etc.
+
+## Disclaimer
+
+TRADING CRYPTOCURRENCIES CARRIES SIGNIFICANT RISK.
 This bot is for educational purposes
 
 Past performance does not guarantee future results

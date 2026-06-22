@@ -68,7 +68,7 @@ class KalshiBTCIntegration:
         self.orders_rejected = 0
 
         mode = "SIMULATION" if simulation_mode else "LIVE"
-        logger.info(f"Initialized Kalshi BTC Integration [{mode}]")
+        logger.info(f"Initialized Kalshi Kush BTC Integration [{mode}]")
 
     # ------------------------------------------------------------------
     # Market discovery (15-min BTC)
@@ -310,7 +310,7 @@ class KalshiBTCIntegration:
     async def start(self) -> bool:
         """Initialize and discover the first market."""
         logger.info("=" * 80)
-        logger.info("STARTING KALSHI BTC 15-MIN INTEGRATION")
+        logger.info("STARTING KALSHI KUSH BTC 15-MIN INTEGRATION")
         logger.info("=" * 80)
 
         ok = await self.discover_current_market()
