@@ -152,7 +152,7 @@ class KalshiClient:
 
         # Debug summary (never log secrets)
         body_keys = list(json_body.keys()) if isinstance(json_body, dict) else None
-        logger.debug(f"[Kalshi] {method} {path} auth={has_auth} params_keys={list(params.keys()) if params else None} body_keys={body_keys}")
+        logger.trace(f"[Kalshi] {method} {path} auth={has_auth} params_keys={list(params.keys()) if params else None} body_keys={body_keys}")
 
         headers = {}
         if has_auth:
@@ -169,7 +169,7 @@ class KalshiClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            logger.debug(f"[Kalshi] {method} {path} -> {resp.status_code} ok")
+            logger.trace(f"[Kalshi] {method} {path} -> {resp.status_code} ok")
             return data
         except requests.HTTPError as e:
             status = getattr(resp, 'status_code', '?')
