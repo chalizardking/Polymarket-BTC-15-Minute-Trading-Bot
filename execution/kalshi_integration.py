@@ -17,6 +17,7 @@ import os
 import asyncio
 import time
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Callable, List
@@ -25,6 +26,16 @@ from collections import deque
 from loguru import logger
 
 from execution.kalshi_client import KalshiClient, get_kalshi_client
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    ticker: str
+    version: int
+    bid: Decimal
+    ask: Decimal
+    mid: Decimal
+    as_of: datetime
 
 
 class KalshiBTCIntegration:
@@ -61,6 +72,11 @@ class KalshiBTCIntegration:
         self._last_bid: Optional[Decimal] = None
         self._last_ask: Optional[Decimal] = None
         self._last_mid: Optional[Decimal] = None
+        self._snapshot_version = 0
+
+        # Quote polling / position monitoring knobs expected by the strategy
+        self.adverse_move_threshold = Decimal("0.03")
+        self.max_position_monitor_seconds = 120
 
         # Stats
         self.quotes_received = 0
@@ -162,6 +178,7 @@ class KalshiBTCIntegration:
                     self._last_bid = best_yes_bid
                     self._last_ask = best_yes_ask
                     self._last_mid = mid
+                    self._snapshot_version += 1
 
                     self.price_history.append(mid)
                     self.quotes_received += 1
@@ -199,6 +216,24 @@ class KalshiBTCIntegration:
             "ask": self._last_ask,
             "mid": self._last_mid or (self._last_bid + self._last_ask) / 2,
         }
+
+    def get_market_snapshot(self) -> Optional[MarketSnapshot]:
+        if (
+            not self.current_ticker
+            or self._last_bid is None
+            or self._last_ask is None
+            or self._last_mid is None
+        ):
+            return None
+
+        return MarketSnapshot(
+            ticker=self.current_ticker,
+            version=self._snapshot_version,
+            bid=self._last_bid,
+            ask=self._last_ask,
+            mid=self._last_mid,
+            as_of=datetime.now(timezone.utc),
+        )
 
     # ------------------------------------------------------------------
     # Order placement (paper + live)
@@ -361,15 +396,46 @@ class KalshiBTCIntegration:
     def get_pending_fills(self) -> List[Dict[str, Any]]:
         """
         Get all active positions awaiting settlement.
-        
+
         Returns list of position dicts for the bot to report to risk engine.
         Called by the bot when checking for market settlements.
         """
         return list(self._active_positions.values())
 
+    def get_active_positions(self) -> List[Dict[str, Any]]:
+        return list(self._active_positions.values())
+
+    def reconcile_pending_orders(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Reconcile recently accepted IOC orders with the bot's risk engine.
+
+        The current integration only tracks accepted fills in `_active_positions`
+        once Kalshi accepts the order, so there is nothing to promote or drop in
+        a separate pending queue yet.
+        """
+        return {"promoted": [], "dropped": []}
+
     def remove_position(self, client_order_id: str) -> Optional[Dict[str, Any]]:
         """Remove a position from active tracking after settlement."""
         return self._active_positions.pop(client_order_id, None)
+
+    async def attempt_exit_position(
+        self,
+        position: Dict[str, Any],
+        current_mid: Decimal,
+    ) -> Dict[str, Any]:
+        """
+        Best-effort live exit hook expected by the strategy.
+
+        The current Kalshi adapter does not yet maintain a full reversible exit
+        path for existing IOC entries, so report that no executable exit was
+        attempted instead of throwing and crashing monitoring.
+        """
+        return {
+            "attempted": False,
+            "accepted": False,
+            "reason": "exit_path_not_implemented",
+        }
 
     async def check_and_settle_positions(self) -> List[Dict[str, Any]]:
         """
@@ -400,14 +466,15 @@ class KalshiBTCIntegration:
                         # We need to determine the final outcome
                         if status == "settled":
                             # Check the settlement value - could be in 'result' or similar field
-                            result = market.get("result", "")
-                            if result.lower() in ("yes", "up"):
+                            result = str(market.get("result", "")).lower()
+                            if result in ("yes", "up"):
                                 exit_price = Decimal("1.0")  # YES won
-                            elif result.lower() in ("no", "down"):
+                            elif result in ("no", "down"):
                                 exit_price = Decimal("0.0")  # NO won
+                            elif isinstance(yes_bid, Decimal) and isinstance(no_bid, Decimal) and no_bid > 0:
+                                exit_price = Decimal("1.0") - no_bid
                             else:
-                                # Fallback: check if yes_bid == 1.0 or no_bid == 1.0 at settlement
-                                exit_price = Decimal("1.0") if yes_bid > 0 else Decimal("0.0")
+                                exit_price = Decimal("0.0")
                             
                             settled.append({
                                 "client_order_id": client_order_id,
