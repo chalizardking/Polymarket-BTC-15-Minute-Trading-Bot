@@ -82,26 +82,8 @@ class KalshiETHIntegration:
 
         market = self.client.find_current_eth_15m_market()
         if not market:
-            logger.warning("No active ETH 15m market found - checking if series exists")
-            # Try broader search
-            resp = self.client.list_markets(status="open", limit=200)
-            markets = resp.get("markets", [])
-            eth_markets = []
-            for m in markets:
-                t = m.get("ticker", "")
-                n = m.get("name", "")
-                if "eth" in t.lower() or "eth" in n.lower() or "ETHEREUM" in n.upper():
-                    eth_markets.append(m)
-            if eth_markets:
-                logger.info(f"Found {len(eth_markets)} ETH-related markets with broader search")
-                market = eth_markets[0]
-            if not market:
-                logger.error("No ETH 15m markets available - creating placeholder for testing")
-                # Use placeholder for paper trading
-                market = {
-                    "ticker": "KXETH15M-TEST",
-                    "close_time": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
-                }
+            logger.error("No active ETH 15-min market found")
+            return False
 
         self.current_market = market
         self.current_ticker = market["ticker"]
@@ -159,6 +141,8 @@ class KalshiETHIntegration:
                     self.quotes_received += 1
                     if on_price:
                         on_price(self._last_bid, self._last_ask, mid)
+                    backoff = self.poll_interval
+                    consecutive_errors = 0
                 else:
                     book = self.client.get_orderbook(self.current_ticker, depth=5)
                     yes_levels = book.get("yes", [])
@@ -183,6 +167,10 @@ class KalshiETHIntegration:
 
                         if len(self.price_history) % 20 == 0:
                             logger.debug(f"[{mode}] ETH Price: ${float(mid):.4f} (history={len(self.price_history)} ticker={self.current_ticker})")
+
+                        # reset backoff on success
+                        backoff = self.poll_interval
+                        consecutive_errors = 0
                     else:
                         logger.debug(f"[{mode}] Empty orderbook for {self.current_ticker}")
 
@@ -237,8 +225,9 @@ class KalshiETHIntegration:
                 price = current_price
                 label = "YES (UP)"
             else:
-                side = "ask"
-                price = current_price
+                side = "bid"
+                price = Decimal("1.0") - current_price
+                price = max(Decimal("0.01"), min(Decimal("0.99"), price.quantize(Decimal("0.01"))))
                 label = "NO (DOWN)"
 
             if float(price) > 0:

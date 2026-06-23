@@ -437,7 +437,10 @@ class KalshiClient:
 
             if not markets:
                 resp = self.list_markets(status="open", limit=200)
-                markets = [m for m in resp.get("markets", []) if "eth" in m.get("ticker", "").lower() and "15" in m.get("ticker", "").lower()]
+                markets = [
+                    m for m in resp.get("markets", [])
+                    if "eth" in m.get("ticker", "").lower() and "15m" in m.get("ticker", "").lower()
+                ]
 
             if not markets:
                 logger.warning("No ETH 15m markets found")
