@@ -96,7 +96,8 @@ class TestPlaceTrade:
         call_kwargs = mock_kalshi_client.create_order.call_args[1]
         assert call_kwargs["ticker"] == "KXBTC15M-LIVE"
         assert call_kwargs["side"] in ("bid", "ask")
-        assert float(call_kwargs["price"]) == 0.40
+        # Short positions buy NO contracts, so price is mirrored: 1 - 0.40 = 0.60
+        assert float(call_kwargs["price"]) == 0.60
 
     def test_place_trade_no_ticker_returns_none(self):
         integ = KalshiBTCIntegration(simulation_mode=False)
