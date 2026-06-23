@@ -137,6 +137,79 @@ class RiskEngine:
             return False, f"Drawdown {drawdown:.1%} exceeds max {self.limits.max_drawdown_pct:.1%}"
         
         return True, None
+
+    def record_fill(
+        self,
+        order_id: str,
+        ticker: str,
+        side: str,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        direction: str,
+    ) -> str:
+        """
+        Record a filled order as an open position.
+        
+        Called when Kalshi IOC order fills. Position is tracked under order_id
+        so it can be closed when the market settles.
+        
+        Args:
+            order_id: Unique order identifier from Kalshi
+            ticker: Market ticker (e.g., "KXBTC15M-XXX")
+            side: "bid" (YES) or "ask" (NO)
+            fill_price: The price at which the order filled
+            fill_quantity: Number of contracts filled
+            direction: "long" (YES) or "short" (NO)
+            
+        Returns:
+            Position ID for tracking
+        """
+        # Calculate position size in USD
+        position_size = Decimal("1.00")  # Fixed at $1 in kalshi_kush
+        
+        position_id = f"{ticker}-{order_id}"
+        
+        self.add_position(
+            position_id=position_id,
+            size=position_size,
+            entry_price=fill_price,
+            direction=direction,
+        )
+        
+        logger.info(
+            f"RECORD_FILL: {ticker} order={order_id} "
+            f"{direction.upper()} {float(fill_quantity):.2f} contracts @ ${float(fill_price):.4f}"
+        )
+        
+        return position_id
+
+    def record_close(
+        self,
+        position_id: str,
+        exit_price: Decimal,
+    ) -> Optional[Decimal]:
+        """
+        Record closing a position when market settles.
+        
+        On Kalshi, positions settle automatically when the market closes.
+        The exit_price is the final settlement value (0.0 or 1.0 for binary).
+        
+        Args:
+            position_id: Position ID from record_fill
+            exit_price: Settlement price (0.0 for NO outcome, 1.0 for YES outcome)
+            
+        Returns:
+            Realized P&L or None if position not found
+        """
+        pnl = self.remove_position(position_id, exit_price)
+        
+        if pnl is not None:
+            logger.info(
+                f"RECORD_CLOSE: {position_id} settled @ ${float(exit_price):.4f} "
+                f"P&L: ${float(pnl):+.2f}"
+            )
+        
+        return pnl
     
     def calculate_position_size(
         self,
@@ -428,9 +501,9 @@ class RiskEngine:
         self._daily_trades = 0
         logger.info("Reset daily statistics")
 
-
 # Singleton instance
 _risk_engine_instance = None
+
 
 def get_risk_engine() -> RiskEngine:
     """Get singleton risk engine."""
@@ -438,3 +511,9 @@ def get_risk_engine() -> RiskEngine:
     if _risk_engine_instance is None:
         _risk_engine_instance = RiskEngine()
     return _risk_engine_instance
+
+
+def reset_risk_engine() -> None:
+    """Reset the singleton (useful for testing)."""
+    global _risk_engine_instance
+    _risk_engine_instance = None

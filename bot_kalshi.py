@@ -71,7 +71,7 @@ from feedback.learning_engine import get_learning_engine
 MARKET_INTERVAL_SECONDS = 900          # 15 minutes
 QUOTE_STABILITY_REQUIRED = 3
 QUOTE_MIN_SPREAD = 0.001
-TRADE_WINDOW_START = 780               # 13 minutes into the interval
+TRADE_WINDOW_START = 600               # 10 minutes into the interval (5-minute window)
 TRADE_WINDOW_END = 840                 # 14 minutes into the interval
 
 TREND_UP_THRESHOLD = 0.60
@@ -89,6 +89,10 @@ class PaperTrade:
     signal_score: float
     signal_confidence: float
     outcome: str = "PENDING"
+    exit_price: float = 0.0
+    pnl: float = 0.0
+    settle_yes: bool = True
+    ticker: str = ""
 
     def to_dict(self):
         return {
@@ -99,6 +103,10 @@ class PaperTrade:
             "signal_score": self.signal_score,
             "signal_confidence": self.signal_confidence,
             "outcome": self.outcome,
+            "exit_price": self.exit_price,
+            "pnl": self.pnl,
+            "settle_yes": self.settle_yes,
+            "ticker": self.ticker,
         }
 
 
@@ -164,12 +172,11 @@ class KalshiBTC15MinStrategy:
 
         # Fusion (reuse the same tuned weights)
         self.fusion_engine = get_fusion_engine()
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
-        self.fusion_engine.set_weight("TickVelocity", 0.25)
-        self.fusion_engine.set_weight("PriceDivergence", 0.18)
-        self.fusion_engine.set_weight("SpikeDetection", 0.12)
-        self.fusion_engine.set_weight("DeribitPCR", 0.10)
-        self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
+        self.fusion_engine.set_weight("TickVelocity", 0.36)
+        self.fusion_engine.set_weight("PriceDivergence", 0.24)
+        self.fusion_engine.set_weight("SpikeDetection", 0.18)
+        self.fusion_engine.set_weight("DeribitPCR", 0.14)
+        self.fusion_engine.set_weight("SentimentAnalysis", 0.08)
 
         # Risk + monitoring
         self.risk_engine = get_risk_engine()
@@ -189,6 +196,10 @@ class KalshiBTC15MinStrategy:
         self._market_stable = False
         self._stable_tick_count = 0
         self.current_market_ticker: Optional[str] = None
+        self._market_snapshot_version = 0
+        self._position_alerts: Dict[str, str] = {}
+        self._last_daily_reset_date = datetime.now(timezone.utc).date()
+        self._shutdown_requested = False
 
         if test_mode:
             logger.warning("=" * 80)
@@ -215,9 +226,15 @@ class KalshiBTC15MinStrategy:
             if val is not None:
                 redis_sim = val == "1"
                 if redis_sim != self.simulation_mode:
+                    if self.simulation_mode and not redis_sim:
+                        logger.error(
+                            "Ignoring Redis request to switch from simulation to live at runtime; "
+                            "restart explicitly with --live if you want real-money trading"
+                        )
+                        return self.simulation_mode
                     self.simulation_mode = redis_sim
                     logger.warning(f"Simulation mode changed via Redis: {redis_sim}")
-                return redis_sim
+                return redis_sim if redis_sim or not self.simulation_mode else self.simulation_mode
         except Exception as e:
             logger.warning(f"Redis sim check failed: {e}")
         return self.simulation_mode
@@ -237,6 +254,8 @@ class KalshiBTC15MinStrategy:
             return False
 
         self.current_market_ticker = self.integration.current_ticker
+        snapshot = self.integration.get_market_snapshot()
+        self._market_snapshot_version = snapshot.version if snapshot else 0
 
         # Start price feed in background
         asyncio.create_task(
@@ -293,18 +312,59 @@ class KalshiBTC15MinStrategy:
             try:
                 now = datetime.now(timezone.utc)
 
+                if now.date() != self._last_daily_reset_date:
+                    self.risk_engine.reset_daily_stats()
+                    self._last_daily_reset_date = now.date()
+
                 # Auto-restart safety
                 uptime_min = (now - self.bot_start_time).total_seconds() / 60
                 if uptime_min >= self.restart_after_minutes:
-                    logger.warning(f"[{mode}] AUTO-RESTART TIME - exiting for fresh start")
-                    os._exit(0)
+                    logger.warning(f"[{mode}] AUTO-RESTART TIME - requesting graceful shutdown for fresh start")
+                    self._shutdown_requested = True
+                    return
+
+                # Fast reconciliation of recently accepted IOC orders
+                reconciliation = self.integration.reconcile_pending_orders()
+                for pos in reconciliation["promoted"]:
+                    position_id = self.risk_engine.record_fill(
+                        order_id=pos["order_id"],
+                        ticker=pos["ticker"],
+                        side=pos.get("order_side", "bid"),
+                        fill_price=pos["fill_price"],
+                        fill_quantity=pos["fill_quantity"],
+                        direction=pos["direction"],
+                    )
+                    logger.info(f"[{mode}] Promoted confirmed fill into risk engine: {position_id}")
+
+                for dropped in reconciliation["dropped"]:
+                    logger.warning(
+                        f"[{mode}] Pending order resolved without fill: order_id={dropped['order_id']} "
+                        f"reason={dropped['reason']} age={dropped['age_seconds']:.1f}s"
+                    )
+
+                await self._monitor_live_positions(mode)
 
                 # Check if we need to roll to the next 15-min market
                 nxt = self.integration.next_switch_time
                 if nxt and now >= nxt:
-                    logger.info(f"[{mode}] Market interval ended - rediscovering next BTC 15m market...")
+                    logger.info(f"[{mode}] Market interval ended - checking for settlements...")
+                    
+                    # Check for settled positions before rolling to new market
+                    settled_positions = await self.integration.check_and_settle_positions()
+                    for pos in settled_positions:
+                        position_id = f"{pos['ticker']}-{pos['order_id']}"
+                        exit_price = pos["exit_price"]
+                        pnl = self.risk_engine.record_close(position_id, exit_price)
+                        if pnl is not None:
+                            logger.info(f"[{mode}] Settled {position_id}: exit=${float(exit_price):.2f} P&L=${float(pnl):+.2f}")
+                        else:
+                            logger.warning(f"[{mode}] Could not record settlement for {position_id}")
+
+                    logger.info(f"[{mode}] Rediscovering next BTC 15m market...")
                     await self.integration.discover_current_market()
                     self.current_market_ticker = self.integration.current_ticker
+                    snapshot = self.integration.get_market_snapshot()
+                    self._market_snapshot_version = snapshot.version if snapshot else 0
                     self._market_stable = False
                     self._stable_tick_count = 0
                     self.last_trade_key = None  # allow immediate trade on new market
@@ -336,6 +396,10 @@ class KalshiBTC15MinStrategy:
             return
 
         now = datetime.now(timezone.utc)
+        market_snapshot = self.integration.get_market_snapshot()
+        if not market_snapshot or market_snapshot.ticker != self.current_market_ticker:
+            logger.debug(f"[{mode}] Skipping: market snapshot unavailable or changed")
+            return
 
         # Compute sub-interval key inside the current 15-min market.
         interval_start = int(now.timestamp() // MARKET_INTERVAL_SECONDS) * MARKET_INTERVAL_SECONDS
@@ -355,7 +419,6 @@ class KalshiBTC15MinStrategy:
 
         if trade_key == self.last_trade_key:
             return
-        self.last_trade_key = trade_key
 
         logger.info("=" * 80)
         logger.info(f"[{mode}] LATE-WINDOW TRADE on Kalshi: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
@@ -365,7 +428,13 @@ class KalshiBTC15MinStrategy:
 
         try:
             # Run the full signal pipeline (same as original)
-            await self._make_trading_decision(current_price)
+            executed = await self._make_trading_decision(
+                current_price,
+                market_ticker=market_snapshot.ticker,
+                market_version=market_snapshot.version,
+            )
+            if executed:
+                self.last_trade_key = trade_key
         except Exception as e:
             logger.exception(f"[{mode}] _make_trading_decision crashed for {self.current_market_ticker} @ ${float(current_price):.4f}: {e}")
 
@@ -384,6 +453,7 @@ class KalshiBTC15MinStrategy:
             "momentum": momentum,
             "volatility": volatility,
             "tick_buffer": list(self._tick_buffer),
+            "allow_blocking_deribit_fetch": False,
             # Order book processor expects a token id on Polymarket; we skip heavy usage here
         }
 
@@ -414,15 +484,27 @@ class KalshiBTC15MinStrategy:
 
         return meta
 
-    async def _make_trading_decision(self, current_price: Decimal):
+    async def _make_trading_decision(
+        self,
+        current_price: Decimal,
+        market_ticker: str,
+        market_version: int,
+    ) -> bool:
         is_sim = await self.check_simulation_mode()
         mode = "LIVE" if not is_sim else "SIM"
 
         if len(self.price_history) < 20:
             logger.warning(f"[{mode}] Not enough price history ({len(self.price_history)})")
-            return
+            return False
 
-        logger.info(f"[{mode}] Running decision pipeline | ticker={self.current_market_ticker} price=${float(current_price):.4f} hist={len(self.price_history)}")
+        logger.info(f"[{mode}] Running decision pipeline | ticker={market_ticker} price=${float(current_price):.4f} hist={len(self.price_history)}")
+
+        if not self.integration.market_version_matches(market_version, market_ticker):
+            logger.warning(
+                f"[{mode}] Market changed before decision execution: expected={market_ticker}@v{market_version} "
+                f"current={self.integration.current_ticker}@v{self.integration._market_version}"
+            )
+            return False
 
         metadata = await self._fetch_market_context(current_price)
 
@@ -436,7 +518,6 @@ class KalshiBTC15MinStrategy:
             (self.spike_detector, "spike"),
             (self.sentiment_processor, "sentiment"),
             (self.divergence_processor, "divergence"),
-            (self.orderbook_processor, "orderbook"),
             (self.tick_velocity_processor, "tick_velocity"),
             (self.deribit_pcr_processor, "pcr"),
         ]:
@@ -452,12 +533,12 @@ class KalshiBTC15MinStrategy:
 
         if not signals:
             logger.info(f"[{mode}] No signals generated")
-            return
+            return False
 
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
+        fused = self.fusion_engine.fuse_signals(signals, min_signals=2, min_score=40.0)
         if not fused:
             logger.info(f"[{mode}] No actionable fused signal (signals={len(signals)})")
-            return
+            return False
 
         logger.info(f"[{mode}] FUSED: {fused.direction.value} score={fused.score:.1f} conf={fused.confidence:.2%} (from {len(signals)} signals)")
 
@@ -471,7 +552,7 @@ class KalshiBTC15MinStrategy:
             logger.info(f"[{mode}] TREND: DOWN ({price_f:.2%}) → buy NO")
         else:
             logger.info(f"[{mode}] TREND: NEUTRAL ({price_f:.2%}) — skipping (coin-flip zone)")
-            return
+            return False
 
         # Risk gate (position count / exposure only, size is fixed)
         valid, err = self.risk_engine.validate_new_position(
@@ -479,39 +560,52 @@ class KalshiBTC15MinStrategy:
         )
         if not valid:
             logger.warning(f"[{mode}] Risk blocked: {err}")
-            return
+            return False
         logger.debug(f"[{mode}] Risk passed")
 
         # Liquidity guard (very conservative)
         quote = self.integration.get_latest_quote()
         if quote:
-            if direction == "long" and quote["ask"] <= Decimal("0.02"):
+            if direction == "long" and quote["ask"] <= Decimal("0.0005"):
                 logger.warning(f"[{mode}] No liquidity on ask (ask={quote['ask']}) — skipping")
-                return
-            if direction == "short" and quote["bid"] <= Decimal("0.02"):
+                return False
+            if direction == "short" and quote["bid"] <= Decimal("0.0005"):
                 logger.warning(f"[{mode}] No liquidity on bid (bid={quote['bid']}) — skipping")
-                return
+                return False
             logger.debug(f"[{mode}] Liquidity ok bid={quote['bid']} ask={quote['ask']}")
         else:
             logger.debug(f"[{mode}] No quote available for liquidity check")
 
+        fixed_price = _kalshi_fix_price(current_price)
+
         # Execute
         try:
             if is_sim:
-                await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+                await self._record_paper_trade(fused, POSITION_SIZE_USD, fixed_price, direction)
             else:
-                logger.info(f"[{mode}] EXECUTING LIVE ORDER: direction={direction} size=${float(POSITION_SIZE_USD):.2f} price=${float(current_price):.4f}")
-                await self._place_live_order(fused, POSITION_SIZE_USD, current_price, direction)
+                logger.info(f"[{mode}] EXECUTING LIVE ORDER: direction={direction} size=${float(POSITION_SIZE_USD):.2f} price=${float(fixed_price):.4f}")
+                await self._place_live_order(
+                    fused,
+                    POSITION_SIZE_USD,
+                    fixed_price,
+                    direction,
+                    market_ticker,
+                    market_version,
+                )
+            return True
         except Exception as e:
-            logger.exception(f"[{mode}] Execution path failed direction={direction} price=${float(current_price):.4f}: {e}")
+            logger.exception(f"[{mode}] Execution path failed direction={direction} price=${float(fixed_price):.4f}: {e}")
+            return False
 
     async def _record_paper_trade(self, signal, size, price, direction):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
 
-        movement = random.uniform(0.02, 0.08) if direction == "long" else random.uniform(-0.08, -0.02)
-        exit_p = price * (Decimal("1.0") + Decimal(str(movement)))
-        exit_p = max(Decimal("0.01"), min(Decimal("0.99"), exit_p))
+        settle_yes = price >= Decimal("0.50")
+        if direction == "long":
+            exit_p = Decimal("1.0") if settle_yes else Decimal("0.0")
+        else:
+            exit_p = Decimal("0.0") if settle_yes else Decimal("1.0")
 
         pnl = size * (exit_p - price) / price if direction == "long" else size * (price - exit_p) / price
         outcome = "WIN" if pnl > 0 else "LOSS"
@@ -524,6 +618,10 @@ class KalshiBTC15MinStrategy:
             signal_score=signal.score,
             signal_confidence=signal.confidence,
             outcome=outcome,
+            exit_price=float(exit_p),
+            pnl=float(pnl),
+            settle_yes=settle_yes,
+            ticker=self.integration.current_ticker or "",
         )
         self.paper_trades.append(pt)
 
@@ -537,15 +635,15 @@ class KalshiBTC15MinStrategy:
             exit_time=exit_time,
             signal_score=signal.score,
             signal_confidence=signal.confidence,
-            metadata={"simulated": True},
+            metadata={"simulated": True, "settle_yes": settle_yes},
         )
 
         logger.info("=" * 80)
         logger.info("[SIMULATION] PAPER TRADE on Kalshi Kush")
         logger.info(f"  Direction: {direction.upper()}")
         logger.info(f"  Size: ${float(size):.2f}")
-        logger.info(f"  Entry: ${float(price):.4f} → Exit: ${float(exit_p):.4f}")
-        logger.info(f"  P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
+        logger.info(f"  Entry: ${float(price):.4f} → Settlement: ${float(exit_p):.4f}")
+        logger.info(f"  P&L: ${float(pnl):+.2f}")
         logger.info(f"  Outcome: {outcome}")
         logger.info("=" * 80)
 
@@ -559,21 +657,113 @@ class KalshiBTC15MinStrategy:
         except Exception as e:
             logger.error(f"Failed to save paper trades: {e}")
 
-    async def _place_live_order(self, signal, size, price, direction):
+    async def _place_live_order(self, signal, size, price, direction, market_ticker: str, market_version: int):
         mode = "LIVE"
         try:
             logger.info(f"[{mode}] Calling integration.place_trade direction={direction} size=${float(size):.2f} price=${float(price):.4f}")
-            order_id = await self.integration.place_trade(
+            result = await self.integration.place_trade(
                 direction=direction,
                 size_usd=size,
                 current_price=price,
+                expected_ticker=market_ticker,
+                expected_market_version=market_version,
             )
-            if order_id:
-                logger.info(f"[{mode}] LIVE ORDER PLACED: order_id={order_id}")
+            if result:
+                # result is a dict with fill details
+                order_id = result.get("order_id")
+                fill_price = result.get("fill_price", price)
+                fill_quantity = result.get("fill_quantity", Decimal("0"))
+                confirmed_fill = bool(result.get("confirmed_fill")) and fill_quantity > 0
+
+                logger.info(f"[{mode}] LIVE ORDER ACCEPTED: order_id={order_id} confirmed_fill={confirmed_fill}")
+
+                if confirmed_fill:
+                    position_id = self.risk_engine.record_fill(
+                        order_id=order_id,
+                        ticker=market_ticker,
+                        side=result.get("order_side", "bid"),
+                        fill_price=fill_price,
+                        fill_quantity=fill_quantity,
+                        direction=direction,
+                    )
+                    logger.info(f"[{mode}] Position recorded in risk engine: {position_id}")
+                else:
+                    logger.warning(
+                        f"[{mode}] Order accepted without confirmed fill yet: order_id={order_id}; "
+                        f"risk engine not updated until reconciliation confirms quantity"
+                    )
             else:
-                logger.error(f"[{mode}] Live order submission returned no order_id (possible rejection or error in integration)")
+                logger.error(f"[{mode}] Live order submission returned no result (possible rejection or error in integration)")
         except Exception as e:
             logger.exception(f"[{mode}] _place_live_order exception: direction={direction} price=${float(price):.4f} size=${float(size):.2f}: {e}")
+
+    async def _monitor_live_positions(self, mode: str) -> None:
+        quote = self.integration.get_latest_quote()
+        if not quote:
+            return
+
+        mid = quote.get("mid")
+        if mid is None:
+            return
+
+        current_mid = Decimal(str(mid))
+        now = datetime.now(timezone.utc)
+        adverse_threshold = self.integration.adverse_move_threshold
+        max_monitor_seconds = self.integration.max_position_monitor_seconds
+
+        for pos in self.integration.get_active_positions():
+            position_id = f"{pos['ticker']}-{pos['order_id']}"
+            entry_price = Decimal(str(pos["fill_price"]))
+            held_seconds = (now - pos["timestamp"]).total_seconds()
+            direction = pos["direction"]
+
+            self.risk_engine.update_position(position_id, current_mid)
+
+            adverse_move = False
+            if direction == "long" and current_mid <= entry_price * (Decimal("1.0") - adverse_threshold):
+                adverse_move = True
+            elif direction == "short" and current_mid >= entry_price * (Decimal("1.0") + adverse_threshold):
+                adverse_move = True
+
+            alert_reason = None
+            if adverse_move:
+                alert_reason = f"adverse_move>{float(adverse_threshold)*100:.1f}%"
+            elif held_seconds >= max_monitor_seconds:
+                alert_reason = f"monitor_timeout>{max_monitor_seconds}s"
+
+            if not alert_reason:
+                self._position_alerts.pop(position_id, None)
+                continue
+
+            previous_reason = self._position_alerts.get(position_id)
+            if previous_reason == alert_reason:
+                continue
+
+            self._position_alerts[position_id] = alert_reason
+            logger.error(
+                f"[{mode}] POSITION ALERT {position_id}: reason={alert_reason} "
+                f"direction={direction} entry=${float(entry_price):.4f} mid=${float(current_mid):.4f} held={held_seconds:.1f}s"
+            )
+
+            exit_result = {"attempted": False, "reason": "live_exit_disabled"}
+            if not self.simulation_mode:
+                exit_result = await self.integration.attempt_exit_position(pos, current_mid)
+
+            if exit_result.get("attempted"):
+                if exit_result.get("accepted"):
+                    logger.error(
+                        f"[{mode}] Submitted best-effort exit order for {position_id}: "
+                        f"side={exit_result.get('side')} price=${float(exit_result.get('price')):.4f} "
+                        f"count={float(exit_result.get('count')):.2f} exit_order_id={exit_result.get('exit_order_id')}"
+                    )
+                else:
+                    logger.error(
+                        f"[{mode}] Exit attempt did not complete for {position_id}: {exit_result.get('reason')}"
+                    )
+            else:
+                logger.error(
+                    f"[{mode}] No executable live exit path completed for {position_id}: {exit_result.get('reason')}"
+                )
 
     async def _start_grafana(self):
         try:
@@ -581,6 +771,14 @@ class KalshiBTC15MinStrategy:
             logger.info("Grafana exporter started on :8000")
         except Exception as e:
             logger.error(f"Grafana failed: {e}")
+
+
+def _kalshi_fix_price(raw: Decimal) -> Decimal:
+    try:
+        rounded = raw.quantize(Decimal("0.01"))
+        return max(Decimal("0.01"), min(Decimal("0.99"), rounded))
+    except Exception:
+        return Decimal("0.50")
 
 
 # =============================================================================
@@ -621,8 +819,9 @@ async def run_kalshi_bot(simulation: bool = True, enable_grafana: bool = True, t
 
         # Keep the process alive with resilience
         logger.info(f"[{mode_str}] Bot running. Press Ctrl+C to stop.")
-        while True:
-            await asyncio.sleep(3600)
+        while not strategy._shutdown_requested:
+            await asyncio.sleep(1)
+        logger.info(f"[{mode_str}] Graceful restart/shutdown requested")
     except KeyboardInterrupt:
         logger.info(f"\n[{mode_str}] Shutting down (KeyboardInterrupt)...")
     except Exception as e:
@@ -640,6 +839,9 @@ def main():
     simulation = not args.live
     if args.test_mode:
         simulation = True
+
+    logger.remove()
+    logger.add(sys.stderr, level="INFO" if args.live else "DEBUG")
 
     if not simulation:
         logger.warning("LIVE TRADING — REAL MONEY AT RISK")

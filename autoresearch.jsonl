@@ -1,0 +1,2 @@
+{"type": "config", "name": "test-runtime", "metricName": "test_runtime_seconds", "metricUnit": "seconds", "bestDirection": "lower"}
+{"run": 1, "commit": "b140372", "metric": 0.706, "status": "keep", "description": "baseline", "timestamp": 1782118312059, "segment": 0, "asi": {"hypothesis": "baseline measurement"}}
