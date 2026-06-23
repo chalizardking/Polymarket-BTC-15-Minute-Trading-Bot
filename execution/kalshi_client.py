@@ -11,11 +11,13 @@ Features:
 Recommended: Start with KALSHI_DEMO=true
 """
 
+from __future__ import annotations
+
 import os
 import time
 import base64
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
 
@@ -222,10 +224,10 @@ class KalshiClient:
         """Get the order book for a market."""
         data = self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
         # Kalshi returns {"orderbook_fp": {"yes_dollars": [...], "no_dollars": [...]}}
-        ob = data.get("orderbook_fp", data)
+        ob = data.get("orderbook_fp", {}) if isinstance(data, dict) else {}
         return {
-            "yes": ob.get("yes_dollars", []),
-            "no": ob.get("no_dollars", []),
+            "yes": ob.get("yes_dollars", []) if isinstance(ob, dict) else [],
+            "no": ob.get("no_dollars", []) if isinstance(ob, dict) else [],
         }
 
     def get_trades(self, ticker: str, limit: int = 100) -> List[Dict[str, Any]]:
@@ -360,27 +362,26 @@ class KalshiClient:
                 logger.warning("No BTC 15m markets found")
                 return None
 
-            # Pick the one that is currently open (closest close_time in the future)
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             active = []
             for m in markets:
                 try:
-                    # Handle nested structure - some endpoints return {market: {...}}
                     market_data = m.get("market", m) if isinstance(m, dict) and "market" in m else m
+                    status = (market_data.get("status") or "").lower()
+                    if status and status != "active":
+                        continue
                     close_ts = market_data.get("close_time")
                     if close_ts:
-                        # Kalshi returns ISO strings
                         close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
+                        if close_dt.tzinfo is None:
+                            close_dt = close_dt.replace(tzinfo=timezone.utc)
                         if close_dt > now:
                             active.append((close_dt, market_data))
                 except Exception:
                     continue
 
             if not active:
-                # Fallback: just return the first
-                market_data = markets[0].get("market", markets[0]) if isinstance(markets[0], dict) and "market" in markets[0] else markets[0]
-                logger.info(f"Using first BTC market: {market_data['ticker']}")
-                return market_data
+                return None
 
             active.sort(key=lambda x: x[0])
             chosen = active[0][1]
@@ -446,23 +447,26 @@ class KalshiClient:
                 logger.warning("No ETH 15m markets found")
                 return None
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             active = []
             for m in markets:
                 try:
                     market_data = m.get("market", m) if isinstance(m, dict) and "market" in m else m
+                    status = (market_data.get("status") or "").lower()
+                    if status and status != "active":
+                        continue
                     close_ts = market_data.get("close_time")
                     if close_ts:
                         close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
+                        if close_dt.tzinfo is None:
+                            close_dt = close_dt.replace(tzinfo=timezone.utc)
                         if close_dt > now:
                             active.append((close_dt, market_data))
                 except Exception:
                     continue
 
             if not active:
-                market_data = markets[0].get("market", markets[0]) if isinstance(markets[0], dict) and "market" in markets[0] else markets[0]
-                logger.info(f"Using first ETH market: {market_data['ticker']}")
-                return market_data
+                return None
 
             active.sort(key=lambda x: x[0])
             chosen = active[0][1]
