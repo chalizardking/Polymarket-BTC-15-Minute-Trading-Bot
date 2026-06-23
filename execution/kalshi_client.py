@@ -420,6 +420,56 @@ class KalshiClient:
             logger.error(f"Error getting mid price for {ticker}: {e}")
             return None
 
+    def find_current_eth_15m_market(self) -> Optional[Dict[str, Any]]:
+        """
+        Find the current active 15-minute ETH market.
+
+        Looks for series KXETH15M (or similar) with status open.
+        Returns the market dict with soonest close_time.
+        """
+        try:
+            resp = self.list_markets(
+                status="open",
+                series_ticker="KXETH15M",
+                limit=100,
+            )
+            markets = resp.get("markets", [])
+
+            if not markets:
+                resp = self.list_markets(status="open", limit=200)
+                markets = [m for m in resp.get("markets", []) if "eth" in m.get("ticker", "").lower() and "15" in m.get("ticker", "").lower()]
+
+            if not markets:
+                logger.warning("No ETH 15m markets found")
+                return None
+
+            now = datetime.utcnow()
+            active = []
+            for m in markets:
+                try:
+                    market_data = m.get("market", m) if isinstance(m, dict) and "market" in m else m
+                    close_ts = market_data.get("close_time")
+                    if close_ts:
+                        close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
+                        if close_dt > now:
+                            active.append((close_dt, market_data))
+                except Exception:
+                    continue
+
+            if not active:
+                market_data = markets[0].get("market", markets[0]) if isinstance(markets[0], dict) and "market" in markets[0] else markets[0]
+                logger.info(f"Using first ETH market: {market_data['ticker']}")
+                return market_data
+
+            active.sort(key=lambda x: x[0])
+            chosen = active[0][1]
+            logger.info(f"Current ETH 15m market: {chosen['ticker']} (closes {chosen.get('close_time')})")
+            return chosen
+
+        except Exception as e:
+            logger.error(f"Error finding ETH 15m market: {e}")
+            return None
+
 
 # Singleton helper
 _kalshi_client_instance: Optional[KalshiClient] = None

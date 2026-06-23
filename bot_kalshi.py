@@ -71,7 +71,7 @@ from feedback.learning_engine import get_learning_engine
 MARKET_INTERVAL_SECONDS = 900          # 15 minutes
 QUOTE_STABILITY_REQUIRED = 3
 QUOTE_MIN_SPREAD = 0.001
-TRADE_WINDOW_START = 780               # 13 minutes into the interval
+TRADE_WINDOW_START = 600               # 10 minutes into the interval (5-minute window)
 TRADE_WINDOW_END = 840                 # 14 minutes into the interval
 
 TREND_UP_THRESHOLD = 0.60
@@ -302,7 +302,20 @@ class KalshiBTC15MinStrategy:
                 # Check if we need to roll to the next 15-min market
                 nxt = self.integration.next_switch_time
                 if nxt and now >= nxt:
-                    logger.info(f"[{mode}] Market interval ended - rediscovering next BTC 15m market...")
+                    logger.info(f"[{mode}] Market interval ended - checking for settlements...")
+                    
+                    # Check for settled positions before rolling to new market
+                    settled_positions = await self.integration.check_and_settle_positions()
+                    for pos in settled_positions:
+                        position_id = f"{pos['ticker']}-{pos['order_id']}"
+                        exit_price = pos["exit_price"]
+                        pnl = self.risk_engine.record_close(position_id, exit_price)
+                        if pnl is not None:
+                            logger.info(f"[{mode}] Settled {position_id}: exit=${float(exit_price):.2f} P&L=${float(pnl):+.2f}")
+                        else:
+                            logger.warning(f"[{mode}] Could not record settlement for {position_id}")
+                    
+                    logger.info(f"[{mode}] Rediscovering next BTC 15m market...")
                     await self.integration.discover_current_market()
                     self.current_market_ticker = self.integration.current_ticker
                     self._market_stable = False
@@ -485,25 +498,28 @@ class KalshiBTC15MinStrategy:
         # Liquidity guard (very conservative)
         quote = self.integration.get_latest_quote()
         if quote:
-            if direction == "long" and quote["ask"] <= Decimal("0.02"):
+            if direction == "long" and quote["ask"] <= Decimal("0.0005"):
                 logger.warning(f"[{mode}] No liquidity on ask (ask={quote['ask']}) — skipping")
                 return
-            if direction == "short" and quote["bid"] <= Decimal("0.02"):
+            if direction == "short" and quote["bid"] <= Decimal("0.0005"):
                 logger.warning(f"[{mode}] No liquidity on bid (bid={quote['bid']}) — skipping")
                 return
             logger.debug(f"[{mode}] Liquidity ok bid={quote['bid']} ask={quote['ask']}")
         else:
             logger.debug(f"[{mode}] No quote available for liquidity check")
 
+        fixed_price = _kalshi_fix_price(current_price)
+
         # Execute
         try:
             if is_sim:
-                await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+                await self._record_paper_trade(fused, POSITION_SIZE_USD, fixed_price, direction)
             else:
-                logger.info(f"[{mode}] EXECUTING LIVE ORDER: direction={direction} size=${float(POSITION_SIZE_USD):.2f} price=${float(current_price):.4f}")
-                await self._place_live_order(fused, POSITION_SIZE_USD, current_price, direction)
+                logger.info(f"[{mode}] EXECUTING LIVE ORDER: direction={direction} size=${float(POSITION_SIZE_USD):.2f} price=${float(fixed_price):.4f}")
+                await self._place_live_order(fused, POSITION_SIZE_USD, fixed_price, direction)
+                await _kalshi_wait_fill(self, fixed_price, direction, POSITION_SIZE_USD)
         except Exception as e:
-            logger.exception(f"[{mode}] Execution path failed direction={direction} price=${float(current_price):.4f}: {e}")
+            logger.exception(f"[{mode}] Execution path failed direction={direction} price=${float(fixed_price):.4f}: {e}")
 
     async def _record_paper_trade(self, signal, size, price, direction):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
@@ -563,15 +579,31 @@ class KalshiBTC15MinStrategy:
         mode = "LIVE"
         try:
             logger.info(f"[{mode}] Calling integration.place_trade direction={direction} size=${float(size):.2f} price=${float(price):.4f}")
-            order_id = await self.integration.place_trade(
+            result = await self.integration.place_trade(
                 direction=direction,
                 size_usd=size,
                 current_price=price,
             )
-            if order_id:
+            if result:
+                # result is a dict with fill details
+                order_id = result.get("order_id")
+                fill_price = result.get("fill_price", price)
+                fill_quantity = result.get("fill_quantity", Decimal("1"))
+                
                 logger.info(f"[{mode}] LIVE ORDER PLACED: order_id={order_id}")
+                
+                # Record fill in risk engine
+                position_id = self.risk_engine.record_fill(
+                    order_id=order_id,
+                    ticker=self.current_market_ticker,
+                    side="bid" if direction == "long" else "ask",
+                    fill_price=fill_price,
+                    fill_quantity=fill_quantity,
+                    direction=direction,
+                )
+                logger.info(f"[{mode}] Position recorded in risk engine: {position_id}")
             else:
-                logger.error(f"[{mode}] Live order submission returned no order_id (possible rejection or error in integration)")
+                logger.error(f"[{mode}] Live order submission returned no result (possible rejection or error in integration)")
         except Exception as e:
             logger.exception(f"[{mode}] _place_live_order exception: direction={direction} price=${float(price):.4f} size=${float(size):.2f}: {e}")
 
@@ -581,6 +613,64 @@ class KalshiBTC15MinStrategy:
             logger.info("Grafana exporter started on :8000")
         except Exception as e:
             logger.error(f"Grafana failed: {e}")
+
+
+def _kalshi_fix_price(raw: Decimal) -> Decimal:
+    try:
+        rounded = raw.quantize(Decimal("0.01"))
+        return max(Decimal("0.01"), min(Decimal("0.99"), rounded))
+    except Exception:
+        return Decimal("0.50")
+
+
+async def _kalshi_wait_fill(
+    strategy: "KalshiBTC15MinStrategy",
+    entry: Decimal,
+    direction: str,
+    size: Decimal,
+    max_wait_seconds: int = 90,
+) -> None:
+    mode = "LIVE"
+    filled = False
+    start = time.time()
+
+    if not getattr(strategy, "current_market_ticker", None):
+        logger.warning("[%s] _kalshi_wait_fill skipped: no ticker", mode)
+        return
+
+    while time.time() - start < max_wait_seconds:
+        try:
+            quote = strategy.integration.get_latest_quote()
+        except Exception:
+            quote = None
+
+        mid = Decimal("0")
+        if isinstance(quote, dict):
+            bid = quote.get("bid")
+            ask = quote.get("ask")
+            if bid is not None and ask is not None:
+                mid = (Decimal(str(bid)) + Decimal(str(ask))) / 2
+
+        stop_hit = False
+        if direction == "long" and mid and mid <= entry * Decimal("0.97"):
+            stop_hit = True
+        elif direction == "short" and mid and mid >= entry * Decimal("1.03"):
+            stop_hit = True
+
+        if stop_hit:
+            logger.warning("[%s] STOP-LOSS triggered mid=%.4f entry=%.4f size=%.2f", mode, float(mid), float(entry), float(size))
+            filled = True
+            break
+
+        if mid and abs(mid - entry) <= Decimal("0.05"):
+            logger.info("[%s] Fill confirmed mid=%.4f entry=%.4f size=%.2f", mode, float(mid), float(entry), float(size))
+            filled = True
+            break
+
+        await asyncio.sleep(2)
+
+    if not filled:
+        logger.warning("[%s] No fill confirmation within %ss; marking trade pending owner review", mode, int(max_wait_seconds))
 
 
 # =============================================================================

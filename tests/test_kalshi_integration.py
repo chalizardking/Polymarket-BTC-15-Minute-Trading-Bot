@@ -1,6 +1,7 @@
 """Unit tests for KalshiBTCIntegration (execution.kalshi_integration)."""
 
 import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
@@ -84,9 +85,13 @@ class TestPlaceTrade:
 
         async def _run():
             return await integ.place_trade("short", Decimal("1.00"), Decimal("0.40"))
-        order_id = asyncio.run(_run())
+        result = asyncio.run(_run())
 
-        assert order_id == "order_live_123"
+        assert result is not None
+        assert result["order_id"] == "order_live_123"
+        assert "fill_price" in result
+        assert "fill_quantity" in result
+        assert result["direction"] == "short"
         mock_kalshi_client.create_order.assert_called_once()
         call_kwargs = mock_kalshi_client.create_order.call_args[1]
         assert call_kwargs["ticker"] == "KXBTC15M-LIVE"
@@ -149,3 +154,39 @@ class TestSingletonFactory:
         a = get_kalshi_integration(simulation_mode=True)
         b = get_kalshi_integration(simulation_mode=False)  # should still return cached
         assert a is b
+
+
+class TestPositionSettlement:
+    def test_check_and_settle_positions_reports_settled(self, mock_kalshi_client):
+        integ = KalshiBTCIntegration(simulation_mode=True)
+        integ.client = mock_kalshi_client
+        integ.current_ticker = "KXBTC15M-SETTLED"
+
+        # Add an active position to track
+        integ._active_positions["test-client-123"] = {
+            "order_id": "order_id_456",
+            "ticker": "KXBTC15M-SETTLED",
+            "side": "bid",
+            "fill_price": Decimal("0.55"),
+            "fill_quantity": Decimal("1"),
+            "direction": "long",
+            "timestamp": datetime.now(timezone.utc),
+        }
+
+        # Mock get_market to return a settled market
+        mock_kalshi_client.get_market.return_value = {
+            "ticker": "KXBTC15M-SETTLED",
+            "status": "settled",
+            "yes_bid": 1.0,
+            "result": "yes",
+        }
+
+        async def _run():
+            return await integ.check_and_settle_positions()
+
+        settled = asyncio.run(_run())
+
+        assert len(settled) == 1
+        assert settled[0]["order_id"] == "order_id_456"
+        assert settled[0]["ticker"] == "KXBTC15M-SETTLED"
+        assert settled[0]["exit_price"] == Decimal("1.0")

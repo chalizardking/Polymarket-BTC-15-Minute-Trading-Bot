@@ -82,7 +82,8 @@ def summary(jsonl_path: str) -> None:
 
 def _get_next_run(jsonl_path: str) -> int:
     entries = _read_entries(jsonl_path)
-    return max((e["run"] for e in entries), default=0) + 1
+    runs = [e["run"] for e in entries if "run" in e]
+    return max(runs, default=0) + 1
 
 def _read_entries(jsonl_path: str) -> list:
     if not Path(jsonl_path).exists():

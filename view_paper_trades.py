@@ -8,16 +8,25 @@ from pathlib import Path
 
 
 def load_paper_trades():
-    """Load paper trades from file."""
-    try:
-        with open('paper_trades.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print("No paper trades file found.")
-        return []
-    except Exception as e:
-        print(f"Error loading paper trades: {e}")
-        return []
+    """Load paper trades from file (checks both Polymarket and Kalshi Kush files)."""
+    # Try Kalshi Kush paper trades first, then fall back to Polymarket
+    kalshi_path = Path("kalshi_kush_paper_trades.json")
+    polymarket_path = Path("paper_trades.json")
+    
+    for trade_file in [kalshi_path, polymarket_path]:
+        try:
+            with open(trade_file, "r") as f:
+                trades = json.load(f)
+                if trades:
+                    print(f"Loaded trades from {trade_file}")
+                    return trades
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            print(f"Error loading {trade_file}: {e}")
+    
+    print("No paper trades file found.")
+    return []
 
 
 def display_paper_trades(trades):
@@ -72,7 +81,7 @@ def main():
     
     if trades:
         print("\nNOTE: These are SIMULATION trades only - no real money involved!")
-        print("To update outcomes, edit paper_trades.json manually")
+        print("To update outcomes, edit the paper trades JSON file manually")
         print()
 
 

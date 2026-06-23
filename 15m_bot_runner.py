@@ -11,7 +11,7 @@ sys.path.insert(0, str(project_root))
 def run_bot():
     """Run the bot with auto-restart using the SAME Python environment."""
     
-    BOT_SCRIPT = "bot.py"
+    BOT_SCRIPT = "bot_kalshi.py"  # Kalshi-native version
     
     # CRITICAL: Use the SAME Python executable
     python_cmd = sys.executable

@@ -6,9 +6,9 @@ python3 -m py_compile tests/test_kalshi_client.py tests/test_kalshi_integration.
 
 # Run the benchmark and measure time
 start_time=$(date +%s.%N)
-output=$(pytest tests/ -v --tb=short 2>&1)
+output=$(/usr/bin/time -f "ELAPSED %e" pytest tests/ -v --tb=short 2>&1) || true
 end_time=$(date +%s.%N)
 
-# Use awk for runtime calculation (more portable than bc)
+# Use awk for runtime calculation
 runtime=$(awk "BEGIN {printf \"%.3f\", $end_time - $start_time}")
 echo "METRIC test_runtime_seconds=$runtime"
