@@ -731,6 +731,9 @@ def main():
     if args.test_mode:
         simulation = True
 
+    logger.remove()
+    logger.add(sys.stderr, level="INFO" if args.live else "DEBUG")
+
     if not simulation:
         logger.warning("LIVE TRADING — REAL MONEY AT RISK")
 
