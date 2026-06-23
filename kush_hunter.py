@@ -139,7 +139,7 @@ async def place_order(ticker: str, direction: str, price: Decimal):
         "type": "limit",
     }
     logger.info("PLACE %s %s @ $%.3f qty=%d", side.upper(), ticker, price, qty)
-    res = await api("POST", "/orders", json=body)
+    res = await api("POST", "/portfolio/events/orders", json=body)
     order = res.get("order", res)
     oid = order.get("order_id", "?")
     status = order.get("status", "?")
