@@ -4,7 +4,7 @@ set -euo pipefail
 DIR="/Users/chalizardking/Projects/kalshi-kush-bot"
 cd "$DIR"
 
-PYTHON="/opt/homebrew/bin/python3.11"
+PYTHON="${KALSHI_PYTHON:-/opt/homebrew/bin/python3}"
 
 export KALSHI_DEMO="${KALSHI_DEMO:-false}"
 
