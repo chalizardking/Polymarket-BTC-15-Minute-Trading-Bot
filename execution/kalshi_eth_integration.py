@@ -337,13 +337,15 @@ class KalshiETHIntegration:
                         no_bid = Decimal(str(market.get("no_bid", 0)))
 
                         if status == "settled":
-                            result = market.get("result", "")
-                            if result.lower() in ("yes", "up"):
+                            result = str(market.get("result", "")).lower()
+                            if result in ("yes", "up"):
                                 exit_price = Decimal("1.0")
-                            elif result.lower() in ("no", "down"):
+                            elif result in ("no", "down"):
                                 exit_price = Decimal("0.0")
+                            elif isinstance(yes_bid, Decimal) and isinstance(no_bid, Decimal) and no_bid > 0:
+                                exit_price = Decimal("1.0") - no_bid
                             else:
-                                exit_price = Decimal("1.0") if yes_bid > 0 else Decimal("0.0")
+                                exit_price = Decimal("0.0")
 
                             settled.append({
                                 "client_order_id": client_order_id,
