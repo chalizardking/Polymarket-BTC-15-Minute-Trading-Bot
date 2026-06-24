@@ -74,6 +74,10 @@ class KalshiBTCIntegration:
         self._last_mid: Optional[Decimal] = None
         self._snapshot_version = 0
 
+        # Alias expected by bot_kalshi._make_trading_decision
+        # _market_version is kept in sync with _snapshot_version on every price update
+        self._market_version = 0
+
         # Quote polling / position monitoring knobs expected by the strategy
         self.adverse_move_threshold = Decimal("0.03")
         self.max_position_monitor_seconds = 120
@@ -179,6 +183,7 @@ class KalshiBTCIntegration:
                     self._last_ask = best_yes_ask
                     self._last_mid = mid
                     self._snapshot_version += 1
+                    self._market_version = self._snapshot_version
 
                     self.price_history.append(mid)
                     self.quotes_received += 1
@@ -234,6 +239,24 @@ class KalshiBTCIntegration:
             mid=self._last_mid,
             as_of=datetime.now(timezone.utc),
         )
+
+    # ------------------------------------------------------------------
+    # Version matching (called by bot_kalshi before execution)
+    # ------------------------------------------------------------------
+
+    def market_version_matches(self, version: int, ticker: str) -> bool:
+        """
+        Check whether the market version and ticker seen by the strategy
+        still match the integration's current state.
+
+        Prevents executing a stale decision if the market rolled over
+        between signal generation and order placement.
+        """
+        if self.current_ticker != ticker:
+            return False
+        if self._market_version != version:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Order placement (paper + live)
