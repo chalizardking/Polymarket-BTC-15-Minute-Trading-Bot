@@ -105,7 +105,7 @@ class KalshiBTCIntegration:
         """
         logger.info("Discovering current BTC 15-min market on Kalshi...")
 
-        market = self.client.find_current_btc_15m_market()
+        market = await self.client.find_current_btc_15m_market()
         if not market:
             logger.error("No active BTC 15-min market found")
             return False
@@ -168,7 +168,7 @@ class KalshiBTCIntegration:
 
         while True:
             try:
-                book = self.client.get_orderbook(self.current_ticker, depth=5)
+                book = await self.client.get_orderbook(self.current_ticker, depth=5)
                 yes_levels = book.get("yes", [])
                 no_levels = book.get("no", [])
 
@@ -303,28 +303,60 @@ class KalshiBTCIntegration:
             return f"sim_{uuid.uuid4().hex[:8]}"
 
         try:
+            # Guard inputs before deriving a live order: an unexpected direction
+            # must not silently fall through to the short branch and place a NO
+            # trade, and the price must be a valid probability in (0, 1).
+            if direction not in ("long", "short"):
+                logger.error(f"[LIVE] Invalid trade direction: {direction!r} — refusing to place order")
+                self.orders_rejected += 1
+                return None
+            if not (Decimal("0") < Decimal(str(current_price)) < Decimal("1")):
+                logger.error(f"[LIVE] Invalid Kalshi price {current_price} for {direction} — refusing to place order")
+                self.orders_rejected += 1
+                return None
+
             # Determine side and price.
             #
-            # Use a symmetric invariant:
-            #   - LONG  = buy YES on the bid side at the YES price
-            #   - SHORT = buy NO  on the bid side at the mirrored NO price
+            # Kalshi V2 semantics:
+            #   side="bid" = buy YES at price p
+            #   side="ask" = sell YES at price p  (equivalent to buy NO at 1-p)
             #
-            # This avoids the fragile "sell YES == buy NO" mapping that was
-            # producing intermittent `invalid_price` exchange rejections.
+            # So:
+            #   LONG  → buy YES  → side="bid",  price = current_price
+            #   SHORT → buy NO   → side="ask",  price = current_price
+            #                        (selling YES at current_price = buying NO at 1-current_price)
             if direction == "long":
                 side = "bid"
                 price = current_price
                 label = "YES (UP)"
             else:
-                side = "bid"
-                price = Decimal("1.0") - current_price
-                price = max(Decimal("0.01"), min(Decimal("0.99"), price.quantize(Decimal("0.01"))))
+                side = "ask"
+                price = current_price
                 label = "NO (DOWN)"
 
+            # Hard safety cap: live notional is fixed at $1.00 (see CLAUDE.md).
+            # Clamp here so any upstream bug can't place an oversized live order.
+            safe_size_usd = Decimal("1.00")
+            if Decimal(str(size_usd)) != safe_size_usd:
+                logger.warning(
+                    f"[LIVE] Overriding requested size ${float(size_usd):.2f} "
+                    f"to safety cap ${float(safe_size_usd):.2f}"
+                )
+            size_usd = safe_size_usd
+
             # Convert USD size to contract count for the side actually being bought.
-            # For a $1 bet at contract price p, count ≈ 1 / p contracts.
-            if float(price) > 0:
-                count = float(size_usd) / float(price)
+            # The cost per contract is the price of the leg we are buying:
+            #   LONG  → buying YES at `price`
+            #   SHORT → buying NO  at (1 - price)   (selling YES at `price`)
+            # Sizing off the YES price for a short would over-buy the NO leg
+            # (e.g. a $1 short at 0.40 → 2.5 contracts → ~$1.50 risk).
+            if direction == "long":
+                cost_per_contract = float(price)
+            else:
+                cost_per_contract = 1.0 - float(price)
+
+            if cost_per_contract > 0:
+                count = float(size_usd) / cost_per_contract
             else:
                 count = float(size_usd)
 
@@ -346,7 +378,7 @@ class KalshiBTCIntegration:
             }
             logger.info(f"[LIVE] Placing order on Kalshi: {label} | {payload_info}")
 
-            resp = self.client.create_order(
+            resp = await self.client.create_order(
                 ticker=self.current_ticker,
                 side=side,
                 count=count,
@@ -361,23 +393,108 @@ class KalshiBTCIntegration:
                 self.orders_placed += 1
                 logger.info(f"[LIVE] ✓ Order accepted: order_id={order_id} ticker={self.current_ticker} side={side} price={float(price):.4f}")
                 
+                # ── IOC Fill Confirmation (Fix #1) ──
+                # Poll up to 3 times with 200ms intervals to confirm actual fill.
+                # IOC orders fill or cancel immediately; the exchange may need
+                # a moment to settle before the query reflects the final state.
+                #
+                # Default to UNCONFIRMED: we only record a position once a real
+                # fill is observed. Recording optimistically on exhausted polls
+                # would create phantom exposure and later trigger exit orders for
+                # contracts that were never filled. Note "resting" is NOT a fill
+                # for an IOC order — it either fills or cancels.
+                fill_price = price
+                fill_quantity = Decimal("0")
+                confirmed_fill = False
+
+                for _poll_attempt in range(3):
+                    await asyncio.sleep(0.2)  # 200ms between polls
+
+                    try:
+                        order_detail = await self.client.get_order(order_id)
+                    except Exception as poll_err:
+                        # Transient polling failure — keep trying; the order was
+                        # already accepted, so don't abort the whole placement.
+                        logger.debug(
+                            f"[LIVE] get_order poll {_poll_attempt + 1}/3 failed for "
+                            f"order_id={order_id}: {poll_err}; retrying..."
+                        )
+                        continue
+                    if order_detail:
+                        status = str(order_detail.get("status", "")).lower()
+                        filled_qty = order_detail.get("filled_count") or order_detail.get("filled")
+                        filled_price = order_detail.get("filled_price") or order_detail.get("average_price")
+
+                        if status in ("filled", "matched", "partially_filled"):
+                            if filled_qty is not None:
+                                fill_quantity = Decimal(str(filled_qty))
+                            elif status in ("filled", "matched"):
+                                # Fully filled but quantity not reported — fall back
+                                # to the ordered count.
+                                fill_quantity = Decimal(str(count))
+                            if filled_price is not None:
+                                fill_price = Decimal(str(filled_price))
+                            confirmed_fill = fill_quantity > 0
+                            logger.info(
+                                f"[LIVE] ✓ IOC fill confirmed (poll {_poll_attempt + 1}/3): order_id={order_id} "
+                                f"status={status} filled_qty={fill_quantity} filled_price={fill_price}"
+                            )
+                            break
+                        elif status in ("canceled", "cancelled", "expired", "resting"):
+                            confirmed_fill = False
+                            logger.warning(
+                                f"[LIVE] ✗ IOC order not filled (status={status}, poll {_poll_attempt + 1}/3): order_id={order_id}; "
+                                f"position NOT recorded in risk engine"
+                            )
+                            break
+                        else:
+                            # status="live" or unknown — try again
+                            logger.debug(
+                                f"[LIVE] Order status={status} for order_id={order_id} (poll {_poll_attempt + 1}/3); "
+                                f"retrying..."
+                            )
+                    else:
+                        logger.debug(f"[LIVE] Could not query order {order_id} (poll {_poll_attempt + 1}/3); retrying...")
+                else:
+                    # All 3 polls exhausted without a confirmed fill.
+                    logger.warning(
+                        f"[LIVE] IOC confirmation exhausted after 3 polls for order_id={order_id}; "
+                        f"position NOT recorded in risk engine"
+                    )
+
+                # Do not record a position unless a real fill was confirmed, to
+                # avoid phantom exposure / phantom exit orders.
+                if not confirmed_fill or fill_quantity <= 0:
+                    self.orders_rejected += 1
+                    logger.warning(
+                        f"[LIVE] No confirmed fill for order_id={order_id} "
+                        f"(confirmed={confirmed_fill}, qty={fill_quantity}) — not tracking position"
+                    )
+                    return None
+
                 # Store position info for tracking - will be reported via get_pending_fills()
+                # Persist client_order_id so the live-exit path (attempt_exit_position)
+                # can later locate and remove this position.
                 self._active_positions[client_order_id] = {
+                    "client_order_id": client_order_id,
                     "order_id": order_id,
                     "ticker": self.current_ticker,
                     "side": side,
-                    "fill_price": price,
-                    "fill_quantity": Decimal(str(count)),
+                    "fill_price": fill_price,
+                    "fill_quantity": fill_quantity,
                     "direction": direction,
+                    "confirmed_fill": confirmed_fill,
                     "timestamp": datetime.now(timezone.utc),
                 }
                 
                 # Return dict with fill details for position tracking
                 return {
                     "order_id": order_id,
-                    "fill_price": price,
-                    "fill_quantity": Decimal(str(count)),
+                    "fill_price": fill_price,
+                    "fill_quantity": fill_quantity,
                     "direction": direction,
+                    "order_side": side,
+                    "confirmed_fill": confirmed_fill,
                 }
             else:
                 logger.error(f"[LIVE] Order response missing order_id: resp={resp}")
@@ -448,17 +565,139 @@ class KalshiBTCIntegration:
         current_mid: Decimal,
     ) -> Dict[str, Any]:
         """
-        Best-effort live exit hook expected by the strategy.
+        Best-effort live exit via reverse IOC order.
 
-        The current Kalshi adapter does not yet maintain a full reversible exit
-        path for existing IOC entries, so report that no executable exit was
-        attempted instead of throwing and crashing monitoring.
+        For a LONG position (holding YES):  sell YES → side="ask", price=current_bid
+        For a SHORT position (holding NO):  sell NO  → side="ask", price=no_bid
+                                            where no_bid = 1 - current_yes_ask
+
+        Uses IOC with a 2% discount to ensure immediate fill.
+        Returns structured result for _monitor_live_positions to log.
         """
-        return {
-            "attempted": False,
-            "accepted": False,
-            "reason": "exit_path_not_implemented",
-        }
+        if self.simulation_mode:
+            return {"attempted": False, "accepted": False, "reason": "simulation_mode"}
+
+        direction = position.get("direction")
+        ticker = position.get("ticker")
+        fill_quantity = position.get("fill_quantity", Decimal("0"))
+        fill_price = position.get("fill_price", Decimal("0"))
+        order_id = position.get("order_id", "unknown")
+
+        if not ticker or not direction or fill_quantity <= 0:
+            return {"attempted": False, "accepted": False, "reason": "invalid_position_data"}
+
+        try:
+            if direction == "long":
+                # Exit long: we hold YES, so sell YES → side="ask".
+                # Price 2% BELOW mid so the IOC crosses down into resting bids.
+                side = "ask"
+                price = (current_mid * Decimal("0.98")).quantize(Decimal("0.01"))
+                price = max(Decimal("0.01"), min(Decimal("0.99"), price))
+                label = "SELL YES (close long)"
+            else:
+                # Exit short: we hold NO. Selling NO is equivalent to BUYING YES,
+                # which on this client is side="bid" (NOT "ask" — reusing the entry
+                # side would buy more NO and *increase* the short).
+                # Price 2% ABOVE mid so the IOC crosses up into resting asks.
+                side = "bid"
+                price = (current_mid * Decimal("1.02")).quantize(Decimal("0.01"))
+                price = max(Decimal("0.01"), min(Decimal("0.99"), price))
+                label = "BUY YES (close short)"
+
+            client_order_id = f"EXIT-{order_id[:20]}-{int(time.time() * 1000)}"
+
+            logger.info(
+                f"[LIVE] Attempting exit: {label} | ticker={ticker} "
+                f"side={side} price=${float(price):.4f} count={float(fill_quantity):.2f}"
+            )
+
+            resp = await self.client.create_order(
+                ticker=ticker,
+                side=side,
+                count=float(fill_quantity),
+                price=f"{float(price):.4f}",
+                client_order_id=client_order_id,
+                time_in_force="immediate_or_cancel",
+                self_trade_prevention_type="taker_at_cross",
+            )
+
+            exit_order_id = resp.get("order_id") or resp.get("order", {}).get("order_id")
+            if exit_order_id:
+                # Confirm fill on the exit order — poll up to 3 times
+                status = "unknown"
+                exit_filled_qty = Decimal("0")
+                for _poll_attempt in range(3):
+                    await asyncio.sleep(0.2)
+                    try:
+                        detail = await self.client.get_order(exit_order_id)
+                    except Exception as poll_err:
+                        logger.debug(
+                            f"[LIVE] exit get_order poll {_poll_attempt + 1}/3 failed for "
+                            f"exit_order_id={exit_order_id}: {poll_err}; retrying..."
+                        )
+                        continue
+                    if detail:
+                        status = str(detail.get("status", "")).lower()
+                        filled_raw = detail.get("filled_count") or detail.get("filled")
+                        if filled_raw is not None:
+                            exit_filled_qty = Decimal(str(filled_raw))
+                        if status in ("filled", "matched", "partially_filled"):
+                            break
+                        elif status in ("canceled", "cancelled", "expired", "resting"):
+                            break
+
+                cli_id = position.get("client_order_id", "")
+                fully_filled = status in ("filled", "matched")
+                # A partial fill reduces remaining exposure; anything else
+                # (canceled/expired/resting/unknown) leaves exposure on the book,
+                # so we keep tracking it rather than silently dropping it.
+                if not fully_filled and status == "partially_filled" and exit_filled_qty <= 0:
+                    # Reported partial but no quantity — treat as unconfirmed.
+                    status = "partial_unconfirmed"
+                accepted = fully_filled or (status == "partially_filled" and exit_filled_qty > 0)
+
+                logger.info(
+                    f"[LIVE] Exit order placed: exit_order_id={exit_order_id} "
+                    f"status={status} filled_qty={exit_filled_qty} original_order_id={order_id}"
+                )
+
+                if fully_filled:
+                    self._active_positions.pop(cli_id, None)
+                elif status == "partially_filled" and exit_filled_qty > 0:
+                    tracked = self._active_positions.get(cli_id)
+                    remaining = fill_quantity - exit_filled_qty
+                    if tracked is None or remaining <= 0:
+                        # Nothing left to track (or no record) — drop it.
+                        self._active_positions.pop(cli_id, None)
+                    else:
+                        tracked["fill_quantity"] = remaining
+                        logger.warning(
+                            f"[LIVE] Exit partially filled ({exit_filled_qty}/{fill_quantity}) — "
+                            f"reduced tracked position {cli_id} to {remaining} remaining"
+                        )
+                else:
+                    logger.warning(
+                        f"[LIVE] Exit not confirmed filled (status={status}) — keeping "
+                        f"position {cli_id} in active tracking"
+                    )
+
+                return {
+                    "attempted": True,
+                    "accepted": accepted,
+                    "exit_order_id": exit_order_id,
+                    "side": side,
+                    "price": price,
+                    "count": fill_quantity,
+                    "filled_count": exit_filled_qty,
+                    "reason": f"exit_status={status}",
+                }
+            else:
+                logger.error(f"[LIVE] Exit order rejected: resp={resp}")
+                return {"attempted": True, "accepted": False, "reason": "order_rejected"}
+
+        except Exception as e:
+            logger.exception(f"[LIVE] attempt_exit_position failed: {e}")
+            return {"attempted": True, "accepted": False, "reason": f"exception:{e}"}
 
     async def check_and_settle_positions(self) -> List[Dict[str, Any]]:
         """
@@ -475,40 +714,67 @@ class KalshiBTCIntegration:
         for client_order_id, pos in list(self._active_positions.items()):
             ticker = pos["ticker"]
             try:
-                market = self.client.get_market(ticker)
+                market_resp = await self.client.get_market(ticker)
+                # Kalshi V2 nests the market under a "market" key; unwrap it so
+                # status/yes_bid/no_bid are read from the right level.
+                market = (
+                    market_resp.get("market", market_resp)
+                    if isinstance(market_resp, dict)
+                    else {}
+                )
                 if market:
                     status = market.get("status", "").lower()
-                    # "settled" means the market close time has passed and outcome is known
-                    if status in ("settled", "closed", "resolved"):
+                    result = str(market.get("result", "")).lower()
+                    has_definitive_result = result in ("yes", "up", "no", "down")
+                    # Only settle on a definitive outcome. A market can report
+                    # status="closed" before it is actually resolved; treating that
+                    # as a settlement would book a phantom 0.0 loss and drop the
+                    # position. Require a settled/resolved status OR a definitive
+                    # result before accounting; otherwise keep tracking.
+                    if status in ("settled", "resolved") or has_definitive_result:
                         # Get the result - check for BTC UP or DOWN outcome
-                        yes_bid = Decimal(str(market.get("yes_bid", 0)))
-                        no_bid = Decimal(str(market.get("no_bid", 0)))
-                        
+                        # Use `or 0` to guard against API returning null values
+                        yes_bid_raw = market.get("yes_bid")
+                        no_bid_raw = market.get("no_bid")
+                        yes_bid = Decimal(str(yes_bid_raw)) if yes_bid_raw is not None else Decimal("0")
+                        no_bid = Decimal(str(no_bid_raw)) if no_bid_raw is not None else Decimal("0")
+                        # Kalshi market bids often arrive in cents (0–100); normalize
+                        # to a 0–1 probability before using them as exit prices.
+                        if yes_bid > 1:
+                            yes_bid /= Decimal("100")
+                        if no_bid > 1:
+                            no_bid /= Decimal("100")
+
                         # Settlement: if YES outcome, exit_price = 1.0; if NO outcome, exit_price = 0.0
                         # For binary markets: settlement_price is the probability of YES at close
                         # We need to determine the final outcome
-                        if status == "settled":
-                            # Check the settlement value - could be in 'result' or similar field
-                            result = str(market.get("result", "")).lower()
-                            if result in ("yes", "up"):
-                                exit_price = Decimal("1.0")  # YES won
-                            elif result in ("no", "down"):
-                                exit_price = Decimal("0.0")  # NO won
-                            elif isinstance(yes_bid, Decimal) and isinstance(no_bid, Decimal) and no_bid > 0:
-                                exit_price = Decimal("1.0") - no_bid
-                            else:
-                                exit_price = Decimal("0.0")
-                            
-                            settled.append({
-                                "client_order_id": client_order_id,
-                                "order_id": pos["order_id"],
-                                "ticker": ticker,
-                                "fill_price": pos["fill_price"],
-                                "fill_quantity": pos["fill_quantity"],
-                                "direction": pos["direction"],
-                                "exit_price": exit_price,
-                            })
-                            to_remove.append(client_order_id)
+                        if result in ("yes", "up"):
+                            exit_price = Decimal("1.0")  # YES won
+                        elif result in ("no", "down"):
+                            exit_price = Decimal("0.0")  # NO won
+                        elif yes_bid > 0:
+                            # Settled YES leg value (≈1.0 for a YES winner). Checked
+                            # before no_bid so a winner reported as yes_bid=1/no_bid=0
+                            # is not mistakenly recorded as a 0.0 loss.
+                            exit_price = yes_bid
+                        elif no_bid > 0:
+                            exit_price = Decimal("1.0") - no_bid
+                        else:
+                            # Terminal status but no result/bid data yet — don't
+                            # invent a 0.0 loss; leave the position tracked.
+                            logger.debug(f"Market {ticker} terminal but no definitive settlement price yet")
+                            continue
+
+                        settled.append({
+                            "client_order_id": client_order_id,
+                            "order_id": pos["order_id"],
+                            "ticker": ticker,
+                            "fill_price": pos["fill_price"],
+                            "fill_quantity": pos["fill_quantity"],
+                            "direction": pos["direction"],
+                            "exit_price": exit_price,
+                        })
+                        to_remove.append(client_order_id)
             except Exception as e:
                 logger.debug(f"Could not check settlement for {ticker}: {e}")
         

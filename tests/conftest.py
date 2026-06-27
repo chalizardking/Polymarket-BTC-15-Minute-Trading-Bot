@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -34,9 +34,13 @@ def sample_tick_buffer():
 
 
 @pytest.fixture
-def mock_kalshi_client():
-    """A MagicMock that behaves like KalshiClient for integration tests."""
-    client = MagicMock()
+def mock_kalshi_client() -> AsyncMock:
+    """An AsyncMock that behaves like KalshiClient for integration tests.
+
+    All methods return AsyncMock by default, so `await client.method()` works
+    in async test code. Set return values via `.return_value` as usual.
+    """
+    client = AsyncMock()
 
     # Default market discovery response (single open 15m BTC market)
     client.list_markets.return_value = {
@@ -46,7 +50,7 @@ def mock_kalshi_client():
                 "event_ticker": "KXBTC15M-26JUN21",
                 "market_type": "binary",
                 "title": "BTC > current at 08:00?",
-                "status": "open",
+                "status": "active",
                 "close_time": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
                 "yes_bid": 45,
                 "yes_ask": 47,
@@ -56,7 +60,7 @@ def mock_kalshi_client():
 
     client.get_market.return_value = {
         "ticker": "KXBTC15M-26JUN210800-00",
-        "status": "open",
+        "status": "active",
     }
 
     # Orderbook with yes/no dollars (Kalshi fp format after normalization in integration)
@@ -76,6 +80,17 @@ def mock_kalshi_client():
     client.find_current_btc_15m_market.return_value = {
         "ticker": "KXBTC15M-26JUN210800-00",
         "close_time": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
+    }
+
+    # get_order returns a single order dict (used by IOC fill confirmation).
+    # Default to a terminal FILLED status with a real fill quantity so the
+    # success-path fixtures record a position; tests that need a canceled/
+    # resting/expired case override this per-test.
+    client.get_order.return_value = {
+        "order_id": "order_live_123",
+        "status": "filled",
+        "filled_count": 2.0,
+        "filled_price": 0.60,
     }
 
     return client

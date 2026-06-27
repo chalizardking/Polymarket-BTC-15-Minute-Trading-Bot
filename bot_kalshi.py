@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from collections import deque
 
 from dotenv import load_dotenv
@@ -71,13 +71,13 @@ from feedback.learning_engine import get_learning_engine
 MARKET_INTERVAL_SECONDS = 900          # 15 minutes
 QUOTE_STABILITY_REQUIRED = 3
 QUOTE_MIN_SPREAD = 0.001
-TRADE_WINDOW_START = 600               # 10 minutes into the interval (5-minute window)
-TRADE_WINDOW_END = 840                 # 14 minutes into the interval
+TRADE_WINDOW_START = 600               # 10 minutes into the interval
+TRADE_WINDOW_END = 900                 # 15 minutes (exclusive) = through minute 14
 
 TREND_UP_THRESHOLD = 0.60
 TREND_DOWN_THRESHOLD = 0.40
 
-POSITION_SIZE_USD = Decimal("1.00")    # Fixed $1 sizing (safety)
+POSITION_SIZE_USD = Decimal("1.00")    # $1 per position (hard safety cap — see CLAUDE.md)
 
 
 @dataclass
@@ -201,6 +201,16 @@ class KalshiBTC15MinStrategy:
         self._last_daily_reset_date = datetime.now(timezone.utc).date()
         self._shutdown_requested = False
 
+        # ── TTL cache for Fear & Greed + Coinbase (Fix #6) ──
+        # Avoids reconnecting NewsSocialDataSource / CoinbaseDataSource on every tick.
+        # Cache stores (value, timestamp); TTL enforced in _fetch_market_context.
+        self._fg_cache: Tuple[Optional[dict], float] = (None, 0.0)
+        self._cb_cache: Tuple[Optional[float], float] = (None, 0.0)
+        self._external_data_ttl: float = 300.0  # 5 minutes
+
+        # Background price-feed task handle; cancelled/replaced on self-restart.
+        self._price_feed_task: Optional[asyncio.Task] = None
+
         if test_mode:
             logger.warning("=" * 80)
             logger.warning("TEST MODE ACTIVE - Trading every minute!")
@@ -209,8 +219,8 @@ class KalshiBTC15MinStrategy:
         logger.info("=" * 80)
         logger.info("KALSHI KUSH BTC 15-MIN STRATEGY INITIALIZED")
         logger.info(f"  Simulation: {simulation_mode}")
-        logger.info("  Fixed $1 per trade")
-        logger.info("  Late window trading (13-14 min into each 15-min market)")
+        logger.info(f"  Fixed ${float(POSITION_SIZE_USD):.2f} per trade")
+        logger.info("  Late window trading (10-14 min into each 15-min market)")
         logger.info("  Brand: Kalshi Kush")
         logger.info("=" * 80)
 
@@ -257,9 +267,11 @@ class KalshiBTC15MinStrategy:
         snapshot = self.integration.get_market_snapshot()
         self._market_snapshot_version = snapshot.version if snapshot else 0
 
-        # Start price feed in background
-        asyncio.create_task(
-            self.integration.start_price_feed(on_price=self._on_price_update)
+        # Start price feed in background with reconnection wrapper (Fix #4).
+        # Keep the handle so a self-restart can cancel it before starting a new
+        # one (otherwise two feeds would both call _on_price_update()).
+        self._price_feed_task = asyncio.create_task(
+            self._resilient_price_feed()
         )
 
         # Start timer loop for market switching
@@ -316,12 +328,17 @@ class KalshiBTC15MinStrategy:
                     self.risk_engine.reset_daily_stats()
                     self._last_daily_reset_date = now.date()
 
-                # Auto-restart safety
+                # Auto-restart safety (Fix #5) — self-restart instead of clean exit
                 uptime_min = (now - self.bot_start_time).total_seconds() / 60
                 if uptime_min >= self.restart_after_minutes:
-                    logger.warning(f"[{mode}] AUTO-RESTART TIME - requesting graceful shutdown for fresh start")
-                    self._shutdown_requested = True
-                    return
+                    logger.warning(
+                        f"[{mode}] AUTO-RESTART TIME ({uptime_min:.0f} min elapsed) — "
+                        f"reinitializing strategy for fresh start"
+                    )
+                    await self._self_restart()
+                    # Keep supervising after restart — daily resets, reconciliation,
+                    # position monitoring, and market switching must continue.
+                    continue
 
                 # Fast reconciliation of recently accepted IOC orders
                 reconciliation = self.integration.reconcile_pending_orders()
@@ -333,6 +350,7 @@ class KalshiBTC15MinStrategy:
                         fill_price=pos["fill_price"],
                         fill_quantity=pos["fill_quantity"],
                         direction=pos["direction"],
+                        size_usd=POSITION_SIZE_USD,
                     )
                     logger.info(f"[{mode}] Promoted confirmed fill into risk engine: {position_id}")
 
@@ -410,7 +428,7 @@ class KalshiBTC15MinStrategy:
 
         seconds_into = elapsed % MARKET_INTERVAL_SECONDS
 
-        # In test mode, trade every minute; otherwise only in late window (13-14 min)
+        # In test mode, trade every minute; otherwise only in late window (10-14 min)
         if self.test_mode:
             if trade_key == self.last_trade_key:
                 return
@@ -438,7 +456,7 @@ class KalshiBTC15MinStrategy:
         except Exception as e:
             logger.exception(f"[{mode}] _make_trading_decision crashed for {self.current_market_ticker} @ ${float(current_price):.4f}: {e}")
 
-    async def _fetch_market_context(self, current_price: Decimal) -> dict:
+    async def _fetch_market_context(self, current_price: Decimal, market_ticker: str) -> dict:
         """Fetch Coinbase spot + Fear & Greed (same as original)."""
         current = float(current_price)
         recent = [float(p) for p in self.price_history[-20:]]
@@ -453,34 +471,72 @@ class KalshiBTC15MinStrategy:
             "momentum": momentum,
             "volatility": volatility,
             "tick_buffer": list(self._tick_buffer),
-            "allow_blocking_deribit_fetch": False,
+            "allow_blocking_deribit_fetch": True,  # Fix #8: enable live Deribit PCR fetch
             # Order book processor expects a token id on Polymarket; we skip heavy usage here
         }
 
-        # Fear & Greed
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            ns = NewsSocialDataSource()
-            await ns.connect()
-            fg = await ns.get_fear_greed_index()
-            await ns.disconnect()
-            if fg and "value" in fg:
-                meta["sentiment_score"] = float(fg["value"])
-                meta["sentiment_classification"] = fg.get("classification", "")
-        except Exception as e:
-            logger.debug(f"Fear&Greed unavailable: {e}")
+        # ── Fear & Greed with TTL cache (Fix #6) ──
+        now_ts = time.time()
+        fg_value, fg_ts = self._fg_cache
+        if fg_value is not None and (now_ts - fg_ts) < self._external_data_ttl:
+            meta["sentiment_score"] = fg_value.get("value_float", 50.0)
+            meta["sentiment_classification"] = fg_value.get("classification", "Neutral")
+        else:
+            try:
+                from data_sources.news_social.adapter import NewsSocialDataSource
+                ns = NewsSocialDataSource()
+                await ns.connect()
+                try:
+                    fg = await ns.get_fear_greed_index()
+                finally:
+                    # Always disconnect, even if the fetch raised, so this
+                    # long-running bot doesn't leak adapter connections/tasks.
+                    await ns.disconnect()
+                if fg and "value" in fg:
+                    fg_val = float(fg["value"])
+                    fg_entry = {"value_float": fg_val, "classification": fg.get("classification", "")}
+                    meta["sentiment_score"] = fg_val
+                    meta["sentiment_classification"] = fg["classification"]
+                    self._fg_cache = (fg_entry, time.time())
+            except Exception as e:
+                logger.debug(f"Fear&Greed unavailable: {e}")
 
-        # Coinbase spot
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            cb = CoinbaseDataSource()
-            await cb.connect()
-            spot = await cb.get_current_price()
-            await cb.disconnect()
-            if spot:
-                meta["spot_price"] = float(spot)
-        except Exception as e:
-            logger.debug(f"Coinbase spot unavailable: {e}")
+        # ── Coinbase spot with TTL cache (Fix #6) ──
+        cb_value, cb_ts = self._cb_cache
+        if cb_value is not None and (now_ts - cb_ts) < self._external_data_ttl:
+            meta["spot_price"] = cb_value
+        else:
+            try:
+                from data_sources.coinbase.adapter import CoinbaseDataSource
+                cb = CoinbaseDataSource()
+                await cb.connect()
+                try:
+                    spot = await cb.get_current_price()
+                finally:
+                    await cb.disconnect()
+                if spot:
+                    meta["spot_price"] = float(spot)
+                    self._cb_cache = (float(spot), time.time())
+            except Exception as e:
+                logger.debug(f"Coinbase spot unavailable: {e}")
+
+        # Kalshi orderbook — feeds OrderBookImbalanceProcessor.
+        # Use the validated snapshot ticker (not the mutable current_ticker) so a
+        # market roll during the awaits above can't fuse this decision with the
+        # next market's book.
+        if self.integration and market_ticker:
+            try:
+                book = await self.integration.client.get_orderbook(market_ticker, depth=10)
+                # Convert Kalshi {"yes": [[price,size],...], "no": [[price,size],...]}
+                # to processor format {"bids": [{"price","size"}...], "asks": [...]}.
+                # A buy-NO level at price p is a sell-YES level at (1 - p), so NO
+                # prices are converted to YES-side ask prices for consistent valuation.
+                meta["orderbook"] = {
+                    "bids": [{"price": str(p), "size": str(s)} for p, s in book.get("yes", [])],
+                    "asks": [{"price": str(1.0 - float(p)), "size": str(s)} for p, s in book.get("no", [])],
+                }
+            except Exception as e:
+                logger.debug(f"Kalshi orderbook unavailable: {e}")
 
         return meta
 
@@ -506,7 +562,7 @@ class KalshiBTC15MinStrategy:
             )
             return False
 
-        metadata = await self._fetch_market_context(current_price)
+        metadata = await self._fetch_market_context(current_price, market_ticker)
 
         # Run all processors (identical calls)
         signals = []
@@ -520,6 +576,7 @@ class KalshiBTC15MinStrategy:
             (self.divergence_processor, "divergence"),
             (self.tick_velocity_processor, "tick_velocity"),
             (self.deribit_pcr_processor, "pcr"),
+            (self.orderbook_processor, "orderbook"),
         ]:
             try:
                 sig = proc.process(current_price=current_price, historical_prices=self.price_history, metadata=processed_meta)
@@ -542,14 +599,48 @@ class KalshiBTC15MinStrategy:
 
         logger.info(f"[{mode}] FUSED: {fused.direction.value} score={fused.score:.1f} conf={fused.confidence:.2%} (from {len(signals)} signals)")
 
-        # Trend filter (this is the key edge preserved from the Polymarket version)
+        # ── Trend filter with signal edge (Fix #7) ──
+        # The raw trend filter only checks if market price is above/below 0.60/0.40.
+        # Fix: also require the fused signal probability to agree with the direction
+        # AND show a meaningful edge over the market-implied probability.
+        #
+        # fused.score is a DIRECTIONLESS consensus magnitude (0–100): how strongly
+        # the signals agree on fused.direction. Map it to an implied P(YES) that
+        # respects direction — bullish pushes above 0.5, bearish below; zero
+        # consensus → 0.5 (no edge). Treating score directly as P(YES) would let a
+        # strong BEARISH signal satisfy the long branch and never help the short branch.
+        is_bullish = "BULLISH" in str(fused.direction).upper()
+        magnitude = fused.score / 100.0
+        signal_prob = (0.5 + 0.5 * magnitude) if is_bullish else (0.5 - 0.5 * magnitude)
         price_f = float(current_price)
+
+        # Minimum edge: signal must disagree with market by at least 3% in our direction
+        SIGNAL_EDGE_MIN = 0.03
+
         if price_f > TREND_UP_THRESHOLD:
+            # Market implies YES > 60%; we need signal to also be strongly bullish
+            # Edge = signal's YES probability minus market's implied YES probability
+            edge = signal_prob - price_f
+            if edge < SIGNAL_EDGE_MIN:
+                logger.info(
+                    f"[{mode}] TREND: UP ({price_f:.2%}) but signal edge too small "
+                    f"(signal={signal_prob:.2%}, edge={edge:+.2%} < {SIGNAL_EDGE_MIN:.0%}) — skipping"
+                )
+                return False
             direction = "long"
-            logger.info(f"[{mode}] TREND: UP ({price_f:.2%}) → buy YES")
+            logger.info(f"[{mode}] TREND: UP ({price_f:.2%}) + signal edge={edge:+.2%} → buy YES")
         elif price_f < TREND_DOWN_THRESHOLD:
+            # Market implies YES < 40%; we need signal to be strongly bearish
+            # For short: edge = (1 - signal_prob) - (1 - price_f) = price_f - signal_prob
+            edge = price_f - signal_prob
+            if edge < SIGNAL_EDGE_MIN:
+                logger.info(
+                    f"[{mode}] TREND: DOWN ({price_f:.2%}) but signal edge too small "
+                    f"(signal={signal_prob:.2%}, edge={edge:+.2%} < {SIGNAL_EDGE_MIN:.0%}) — skipping"
+                )
+                return False
             direction = "short"
-            logger.info(f"[{mode}] TREND: DOWN ({price_f:.2%}) → buy NO")
+            logger.info(f"[{mode}] TREND: DOWN ({price_f:.2%}) + signal edge={edge:+.2%} → buy NO")
         else:
             logger.info(f"[{mode}] TREND: NEUTRAL ({price_f:.2%}) — skipping (coin-flip zone)")
             return False
@@ -601,13 +692,46 @@ class KalshiBTC15MinStrategy:
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
 
-        settle_yes = price >= Decimal("0.50")
+        # ── Paper trade realism (Fix #9) ──
+        # Instead of assuming binary settlement based on price >= 0.50,
+        # model the settlement as a weighted probability draw that respects
+        # the actual market price and the signal's directional conviction.
+        # The market price IS the implied probability of YES outcome.
+        price_f = float(price)
+
+        # Convert the fused signal into an implied P(YES). `confidence` is a
+        # directionless magnitude, so a bearish signal must LOWER P(YES) — using
+        # it raw would bias bearish trades toward YES and corrupt paper P&L.
+        is_bullish = "BULLISH" in str(signal.direction).upper()
+        magnitude = float(signal.score) / 100.0
+        signal_yes_prob = (0.5 + 0.5 * magnitude) if is_bullish else (0.5 - 0.5 * magnitude)
+
+        # Weighted blend: 70% market implied, 30% signal-implied YES probability.
+        # This creates a more realistic win/loss distribution.
+        blended_prob_yes = 0.7 * price_f + 0.3 * signal_yes_prob
+        blended_prob_yes = max(0.01, min(0.99, blended_prob_yes))
+
+        # Stochastic settlement: draw from uniform, compare to blended probability
+        draw = random.random()
+        settle_yes = draw < blended_prob_yes
+
         if direction == "long":
             exit_p = Decimal("1.0") if settle_yes else Decimal("0.0")
         else:
             exit_p = Decimal("0.0") if settle_yes else Decimal("1.0")
 
-        pnl = size * (exit_p - price) / price if direction == "long" else size * (price - exit_p) / price
+        # P&L for binary options: contracts = size / order_price, profit = contracts * (payout - order_price).
+        # exit_p already encodes the settlement value of the leg we hold (1 if our
+        # side won, else 0 — see the direction-aware assignment above), so payout
+        # is exit_p for both long and short. Only the entry cost differs:
+        #   long  → bought YES at `price`
+        #   short → bought NO  at (1 - price)
+        if direction == "long":
+            order_price = price
+        else:
+            order_price = Decimal("1.0") - price
+        payout = exit_p
+        pnl = size * (payout - order_price) / order_price
         outcome = "WIN" if pnl > 0 else "LOSS"
 
         pt = PaperTrade(
@@ -665,19 +789,17 @@ class KalshiBTC15MinStrategy:
                 direction=direction,
                 size_usd=size,
                 current_price=price,
-                expected_ticker=market_ticker,
-                expected_market_version=market_version,
             )
             if result:
-                # result is a dict with fill details
+                # result is a dict with fill details (including IOC fill confirmation)
                 order_id = result.get("order_id")
                 fill_price = result.get("fill_price", price)
                 fill_quantity = result.get("fill_quantity", Decimal("0"))
-                confirmed_fill = bool(result.get("confirmed_fill")) and fill_quantity > 0
+                confirmed_fill = result.get("confirmed_fill", False)
 
                 logger.info(f"[{mode}] LIVE ORDER ACCEPTED: order_id={order_id} confirmed_fill={confirmed_fill}")
 
-                if confirmed_fill:
+                if confirmed_fill and fill_quantity > 0:
                     position_id = self.risk_engine.record_fill(
                         order_id=order_id,
                         ticker=market_ticker,
@@ -685,12 +807,13 @@ class KalshiBTC15MinStrategy:
                         fill_price=fill_price,
                         fill_quantity=fill_quantity,
                         direction=direction,
+                        size_usd=POSITION_SIZE_USD,
                     )
                     logger.info(f"[{mode}] Position recorded in risk engine: {position_id}")
                 else:
                     logger.warning(
-                        f"[{mode}] Order accepted without confirmed fill yet: order_id={order_id}; "
-                        f"risk engine not updated until reconciliation confirms quantity"
+                        f"[{mode}] Order NOT filled (confirmed_fill={confirmed_fill}): order_id={order_id}; "
+                        f"risk engine NOT updated — IOC was rejected or expired at exchange"
                     )
             else:
                 logger.error(f"[{mode}] Live order submission returned no result (possible rejection or error in integration)")
@@ -717,12 +840,22 @@ class KalshiBTC15MinStrategy:
             held_seconds = (now - pos["timestamp"]).total_seconds()
             direction = pos["direction"]
 
+            # ── Short Monitoring Math (Fix #3) ──
+            # Both entry_price and current_mid must be on the same side (YES)
+            # for apples-to-apples comparison.
+            # - LONG: entry_price IS the YES price → compare directly to current_mid (YES mid)
+            # - SHORT: entry_price is the NO price → convert to YES side: YES_entry = 1 - NO_entry
+            if direction == "short":
+                entry_price_yes = Decimal("1.0") - entry_price
+            else:
+                entry_price_yes = entry_price
+
             self.risk_engine.update_position(position_id, current_mid)
 
             adverse_move = False
-            if direction == "long" and current_mid <= entry_price * (Decimal("1.0") - adverse_threshold):
+            if direction == "long" and current_mid <= entry_price_yes * (Decimal("1.0") - adverse_threshold):
                 adverse_move = True
-            elif direction == "short" and current_mid >= entry_price * (Decimal("1.0") + adverse_threshold):
+            elif direction == "short" and current_mid >= entry_price_yes * (Decimal("1.0") + adverse_threshold):
                 adverse_move = True
 
             alert_reason = None
@@ -771,6 +904,102 @@ class KalshiBTC15MinStrategy:
             logger.info("Grafana exporter started on :8000")
         except Exception as e:
             logger.error(f"Grafana failed: {e}")
+
+    async def _resilient_price_feed(self) -> None:
+        """Wrapper that restarts the price feed if it dies unexpectedly.
+
+        The inner start_price_feed already handles transient API errors with
+        backoff; this wrapper catches task cancellation or unrecoverable crashes
+        and relaunches after a delay.
+        """
+        mode = "LIVE" if not self.simulation_mode else "SIM"
+        feed_restart_delay = 5.0
+
+        while True:
+            try:
+                logger.info(f"[{mode}] Starting price feed for {self.integration.current_ticker}")
+                await self.integration.start_price_feed(on_price=self._on_price_update)
+                # If start_price_feed returns normally (shouldn't — it's while True),
+                # treat it as a feed death and restart
+                feed_restart_delay = 5.0  # Reset backoff on clean return
+                logger.warning(f"[{mode}] Price feed exited normally — restarting in {feed_restart_delay}s")
+            except asyncio.CancelledError:
+                logger.info(f"[{mode}] Price feed task cancelled — not restarting")
+                return
+            except Exception as e:
+                logger.exception(f"[{mode}] Price feed crashed: {e} — restarting in {feed_restart_delay}s")
+
+            await asyncio.sleep(feed_restart_delay)
+            # Exponential backoff for repeated crashes, capped at 60s
+            feed_restart_delay = min(feed_restart_delay * 1.5, 60.0)
+
+    async def _self_restart(self) -> None:
+        """Reinitialize strategy state for a fresh 90-minute cycle.
+
+        Preserves the Redis connection and Grafana but resets the timer,
+        caches, and position tracking so the bot can continue without
+        requiring an external process supervisor.
+
+        Transactional: a fresh integration is fully started BEFORE the old one
+        and its feed are torn down, so a failed restart leaves the existing
+        integration/feed intact rather than half-reset.
+        """
+        mode = "LIVE" if not self.simulation_mode else "SIM"
+        logger.warning(f"[{mode}] ═══ SELF-RESTART: resetting state for fresh 90-min cycle ═══")
+
+        # Build and validate the replacement integration first; keep the current
+        # one untouched until we know the new one is good.
+        old_integration = self.integration
+        old_feed = getattr(self, "_price_feed_task", None)
+
+        import execution.kalshi_integration as ki
+        ki._integration_instance = None
+        new_integration = get_kalshi_integration(simulation_mode=self.simulation_mode)
+
+        ok = await new_integration.start()
+        if not ok:
+            logger.error(f"[{mode}] Self-restart failed: could not discover market — keeping current integration")
+            # Restore the singleton to the still-running integration.
+            ki._integration_instance = old_integration
+            return
+
+        # New integration is good — now tear down the old feed (which drives
+        # _on_price_update against the old state) before swapping state, so two
+        # feeds can't both schedule trades.
+        if old_feed is not None and not old_feed.done():
+            old_feed.cancel()
+            try:
+                await old_feed
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Reset timing
+        self.bot_start_time = datetime.now(timezone.utc)
+        self._shutdown_requested = False
+
+        # Clear caches
+        self._fg_cache = (None, 0.0)
+        self._cb_cache = (None, 0.0)
+
+        # Reset market state and swap in the new integration
+        self.integration = new_integration
+        self._market_stable = False
+        self._stable_tick_count = 0
+        self.last_trade_key = None
+        self._position_alerts.clear()
+        self.price_history.clear()
+        self._tick_buffer.clear()
+
+        self.current_market_ticker = self.integration.current_ticker
+        snapshot = self.integration.get_market_snapshot()
+        self._market_snapshot_version = snapshot.version if snapshot else 0
+
+        # Start the replacement price feed through the resilient wrapper (Fix #4)
+        self._price_feed_task = asyncio.create_task(
+            self._resilient_price_feed()
+        )
+
+        logger.warning(f"[{mode}] ✓ Self-restart complete — now trading on: {self.current_market_ticker}")
 
 
 def _kalshi_fix_price(raw: Decimal) -> Decimal:

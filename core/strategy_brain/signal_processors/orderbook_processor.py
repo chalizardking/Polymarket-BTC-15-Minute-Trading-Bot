@@ -110,6 +110,52 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             logger.warning(f"OrderBook fetch failed for {token_id[:16]}…: {e}")
             return None
 
+    @staticmethod
+    def _normalize_levels(levels: Any) -> List[Dict]:
+        """Coerce a list of price levels into [{'price':p, 'size':s}, ...].
+
+        Accepts either Polymarket-style dicts ({'price':..,'size':..}) or
+        Kalshi-style [price, size] pairs.
+        """
+        normalized: List[Dict] = []
+        if not isinstance(levels, (list, tuple)):
+            return normalized
+        for level in levels:
+            if isinstance(level, dict):
+                normalized.append(level)
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                normalized.append({"price": level[0], "size": level[1]})
+        return normalized
+
+    def _normalize_book(self, book: Dict[str, Any]) -> tuple[List[Dict], List[Dict]]:
+        """Normalize a raw order book into (bids, asks).
+
+        Supports two shapes:
+          - Polymarket/CLOB: {'bids': [...], 'asks': [...]}
+          - Kalshi:          {'yes': [...], 'no': [...]}
+            YES demand (resting buy-YES) maps to bids; NO demand
+            (buy-NO = sell-YES) maps to asks.
+        """
+        if "bids" in book or "asks" in book:
+            return (
+                self._normalize_levels(book.get("bids", [])),
+                self._normalize_levels(book.get("asks", [])),
+            )
+        if "yes" in book or "no" in book:
+            # YES demand (buy-YES) maps directly to bids. A Kalshi buy-NO level
+            # at price p is a sell-YES level at (1 - p), so NO levels must be
+            # converted to YES-side ask prices before this processor values them
+            # as price * size — otherwise ask volume/walls are mispriced.
+            bids = self._normalize_levels(book.get("yes", []))
+            asks: List[Dict] = []
+            for level in self._normalize_levels(book.get("no", [])):
+                try:
+                    asks.append({"price": 1.0 - float(level["price"]), "size": level["size"]})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return bids, asks
+        return [], []
+
     def _parse_levels(self, levels: List[Dict]) -> float:
         """Sum total volume across price levels (returns USD volume)."""
         total = 0.0
@@ -143,21 +189,36 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         historical_prices: list,
         metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
-        """Fetch order book synchronously and generate signal."""
+        """
+        Compute signal from order book data.
+
+        Supports two data paths via metadata:
+          1. Kalshi: metadata['orderbook'] = {'bids': [...], 'asks': [...]} — uses pre-fetched data
+          2. Polymarket CLOB: metadata['yes_token_id'] — fetches live from API
+
+        If both are provided, the pre-fetched orderbook takes precedence.
+        """
         if not self.is_enabled or not metadata:
             return None
 
-        token_id = metadata.get("yes_token_id")
-        if not token_id:
-            return None
-
         try:
-            book = self.fetch_order_book(token_id)
-            if not book:
-                return None
-
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
+            # --- Determine data source ---
+            orderbook_data = metadata.get("orderbook")
+            if isinstance(orderbook_data, dict):
+                # A provided orderbook always takes precedence (even when empty),
+                # so an empty snapshot does not silently trigger a live fetch.
+                # Normalize so both Kalshi ({'yes','no'}) and CLOB
+                # ({'bids','asks'}) book shapes are accepted.
+                bids, asks = self._normalize_book(orderbook_data)
+            else:
+                token_id = metadata.get("yes_token_id")
+                if not token_id:
+                    return None
+                book = self.fetch_order_book(token_id)
+                if not book:
+                    return None
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
 
             bid_volume = self._parse_levels(bids)
             ask_volume = self._parse_levels(asks)

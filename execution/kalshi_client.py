@@ -1,5 +1,5 @@
 """
-Kalshi Client - Authenticated REST client for Kalshi prediction markets.
+Kalshi Client - Async REST client for Kalshi prediction markets.
 
 Features:
 - RSA-PSS request signing (required by Kalshi)
@@ -7,6 +7,7 @@ Features:
 - Core trading endpoints: markets, orderbook, orders, portfolio
 - Idempotent orders via client_order_id
 - Price handling in decimal dollars (e.g. "0.6500")
+- Fully async via httpx.AsyncClient (non-blocking event loop)
 
 Recommended: Start with KALSHI_DEMO=true
 """
@@ -19,12 +20,10 @@ import base64
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-from urllib.parse import urlencode
-
 from loguru import logger
 
 try:
-    import requests
+    import httpx
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
     DEPS_AVAILABLE = True
@@ -37,6 +36,7 @@ class KalshiClient:
     Production-grade Kalshi API client.
 
     Authentication uses RSA-PSS signatures over (timestamp + method + path).
+    All HTTP methods are async — callers must `await`.
 
     Environment variables (if not passed explicitly):
       - KALSHI_KEY_ID
@@ -56,7 +56,7 @@ class KalshiClient:
     ):
         if not DEPS_AVAILABLE:
             raise ImportError(
-                "Missing dependencies. Install: pip install requests cryptography"
+                "Missing dependencies. Install: pip install httpx cryptography"
             )
 
         self.key_id = key_id or os.getenv("KALSHI_KEY_ID")
@@ -89,8 +89,11 @@ class KalshiClient:
                 self.private_key = None
                 logger.warning("No Kalshi private key provided - public endpoints only")
 
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
+        self.http = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={"Accept": "application/json"},
+            timeout=30.0,
+        )
 
         mode = "DEMO" if demo else "PRODUCTION"
         logger.info(f"Initialized Kalshi Client (Kalshi Kush) [{mode}]")
@@ -137,7 +140,7 @@ class KalshiClient:
     # Low-level HTTP
     # ------------------------------------------------------------------
 
-    def _request(
+    async def _request(
         self,
         method: str,
         path: str,
@@ -145,11 +148,10 @@ class KalshiClient:
         json_body: Optional[Dict[str, Any]] = None,
         require_auth: bool = False,
     ) -> Dict[str, Any]:
-        """Make a signed request to the Kalshi API.
+        """Make a signed request to the Kalshi API (non-blocking).
 
         Comprehensive logging + error handling for live execution.
         """
-        url = f"{self.base_url}{path}"
         has_auth = bool(require_auth or self.private_key)
 
         # Debug summary (never log secrets)
@@ -161,25 +163,29 @@ class KalshiClient:
             headers = self._auth_headers(method, path)
 
         try:
-            resp = self.session.request(
+            resp = await self.http.request(
                 method=method,
-                url=url,
+                url=path,
                 headers=headers,
                 params=params,
                 json=json_body,
-                timeout=30,
             )
             resp.raise_for_status()
-            data = resp.json()
+            # A successful empty body (e.g. 204 No Content from cancel_order)
+            # has nothing to parse — return an empty dict rather than letting
+            # resp.json() raise and turn a success into a failure.
+            if not resp.content:
+                data: Dict[str, Any] = {}
+            else:
+                data = resp.json()
             logger.trace(f"[Kalshi] {method} {path} -> {resp.status_code} ok")
             return data
-        except requests.HTTPError as e:
-            status = getattr(resp, 'status_code', '?')
-            text = getattr(resp, 'text', str(e))
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            text = e.response.text
             logger.error(f"[Kalshi] HTTP {status} {method} {path}: {text}")
-            # Re-raise with context
             raise
-        except requests.RequestException as e:
+        except httpx.RequestError as e:
             logger.exception(f"[Kalshi] Network error {method} {path}: {e}")
             raise
         except Exception as e:
@@ -190,7 +196,7 @@ class KalshiClient:
     # Public Market Data
     # ------------------------------------------------------------------
 
-    def list_markets(
+    async def list_markets(
         self,
         status: str = "open",
         series_ticker: Optional[str] = None,
@@ -214,15 +220,15 @@ class KalshiClient:
         if cursor:
             params["cursor"] = cursor
 
-        return self._request("GET", "/markets", params=params)
+        return await self._request("GET", "/markets", params=params)
 
-    def get_market(self, ticker: str) -> Dict[str, Any]:
+    async def get_market(self, ticker: str) -> Dict[str, Any]:
         """Get a single market by ticker."""
-        return self._request("GET", f"/markets/{ticker}")
+        return await self._request("GET", f"/markets/{ticker}")
 
-    def get_orderbook(self, ticker: str, depth: int = 20) -> Dict[str, Any]:
+    async def get_orderbook(self, ticker: str, depth: int = 20) -> Dict[str, Any]:
         """Get the order book for a market."""
-        data = self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
+        data = await self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
         # Kalshi returns {"orderbook_fp": {"yes_dollars": [...], "no_dollars": [...]}}
         ob = data.get("orderbook_fp", {}) if isinstance(data, dict) else {}
         return {
@@ -230,16 +236,16 @@ class KalshiClient:
             "no": ob.get("no_dollars", []) if isinstance(ob, dict) else [],
         }
 
-    def get_trades(self, ticker: str, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_trades(self, ticker: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get recent trades for a market."""
-        data = self._request("GET", "/markets/trades", params={"ticker": ticker, "limit": limit})
+        data = await self._request("GET", "/markets/trades", params={"ticker": ticker, "limit": limit})
         return data.get("trades", [])
 
     # ------------------------------------------------------------------
     # Authenticated Trading
     # ------------------------------------------------------------------
 
-    def create_order(
+    async def create_order(
         self,
         ticker: str,
         side: str,                    # "bid" or "ask" (V2 style)
@@ -287,7 +293,7 @@ class KalshiClient:
         logger.info(f"[Kalshi] Submitting order payload: ticker={ticker} side={side} count={count_str} price={price_str} tif={time_in_force} stp={self_trade_prevention_type} client_order_id={client_order_id}")
 
         try:
-            return self._request(
+            return await self._request(
                 "POST",
                 "/portfolio/events/orders",
                 json_body=payload,
@@ -297,15 +303,15 @@ class KalshiClient:
             logger.exception("[Kalshi] create_order failed (see above for payload and HTTP details)")
             raise
 
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel a resting order."""
-        return self._request(
+        return await self._request(
             "DELETE",
             f"/portfolio/events/orders/{order_id}",
             require_auth=True,
         )
 
-    def get_orders(
+    async def get_orders(
         self,
         ticker: Optional[str] = None,
         status: Optional[str] = None,
@@ -318,7 +324,7 @@ class KalshiClient:
         if status:
             params["status"] = status
 
-        data = self._request(
+        data = await self._request(
             "GET",
             "/portfolio/orders",
             params=params,
@@ -326,19 +332,50 @@ class KalshiClient:
         )
         return data.get("orders", [])
 
-    def get_positions(self) -> Dict[str, Any]:
-        """Get current portfolio positions."""
-        return self._request("GET", "/portfolio/positions", require_auth=True)
+    async def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single order by ID.
 
-    def get_balance(self) -> Dict[str, Any]:
+        Returns the order dict, None on a genuine 404/not-found, and re-raises
+        non-404 HTTP errors and transport failures so callers can distinguish a
+        missing order from a transient polling failure.
+
+        Used for IOC fill confirmation: after placing an immediate_or_cancel
+        order we poll this to confirm the actual fill quantity and price.
+        """
+        try:
+            data = await self._request(
+                "GET",
+                f"/portfolio/orders/{order_id}",
+                require_auth=True,
+            )
+            # Kalshi V2 nests under "order" key
+            return data.get("order", data) if isinstance(data, dict) else None
+        except httpx.HTTPStatusError as e:
+            # Only a genuine "not found" should degrade to None. Transport/auth/
+            # server errors must surface so callers (e.g. IOC fill confirmation)
+            # can tell a missing order apart from a transient polling failure.
+            if e.response.status_code == 404:
+                logger.warning(f"[Kalshi] get_order({order_id}) returned 404 (not found)")
+                return None
+            logger.error(f"[Kalshi] get_order({order_id}) failed: {e}")
+            raise
+        except httpx.RequestError as e:
+            logger.error(f"[Kalshi] get_order({order_id}) network error: {e}")
+            raise
+
+    async def get_positions(self) -> Dict[str, Any]:
+        """Get current portfolio positions."""
+        return await self._request("GET", "/portfolio/positions", require_auth=True)
+
+    async def get_balance(self) -> Dict[str, Any]:
         """Get account balance."""
-        return self._request("GET", "/portfolio/balance", require_auth=True)
+        return await self._request("GET", "/portfolio/balance", require_auth=True)
 
     # ------------------------------------------------------------------
     # Convenience helpers for 15-min BTC strategy
     # ------------------------------------------------------------------
 
-    def find_current_btc_15m_market(self) -> Optional[Dict[str, Any]]:
+    async def find_current_btc_15m_market(self) -> Optional[Dict[str, Any]]:
         """
         Find the current active 15-minute BTC market.
 
@@ -346,7 +383,7 @@ class KalshiClient:
         Returns the market dict with soonest close_time.
         """
         try:
-            resp = self.list_markets(
+            resp = await self.list_markets(
                 status="open",
                 series_ticker="KXBTC15M",
                 limit=100,
@@ -355,7 +392,7 @@ class KalshiClient:
 
             if not markets:
                 # Try broader search
-                resp = self.list_markets(status="open", limit=200)
+                resp = await self.list_markets(status="open", limit=200)
                 markets = [m for m in resp.get("markets", []) if "btc" in m.get("ticker", "").lower() and "15m" in m.get("ticker", "").lower()]
 
             if not markets:
@@ -368,7 +405,8 @@ class KalshiClient:
                 try:
                     market_data = m.get("market", m) if isinstance(m, dict) and "market" in m else m
                     status = (market_data.get("status") or "").lower()
-                    if status and status != "active":
+                    # Kalshi API: tradable markets are "open" (legacy/tests may use "active")
+                    if status and status not in ("open", "active"):
                         continue
                     close_ts = market_data.get("close_time")
                     if close_ts:
@@ -392,90 +430,13 @@ class KalshiClient:
             logger.error(f"Error finding BTC 15m market: {e}")
             return None
 
-    def get_mid_price(self, ticker: str) -> Optional[Decimal]:
-        """Get a simple mid price from the order book."""
-        try:
-            book = self.get_orderbook(ticker, depth=1)
-            yes = book.get("yes", [])
-            no = book.get("no", [])
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-            if yes and no:
-                best_yes_bid = Decimal(str(yes[0][0])) if yes else None
-                best_no_bid = Decimal(str(no[0][0])) if no else None
-
-                if best_yes_bid is not None and best_no_bid is not None:
-                    # In Kalshi, best yes ask ≈ 1 - best no bid
-                    best_yes_ask = Decimal("1.0") - best_no_bid
-                    mid = (best_yes_bid + best_yes_ask) / 2
-                    return mid
-
-            # Fallback to last_price - response is nested under "market" key
-            market_response = self.get_market(ticker)
-            market = market_response.get("market", market_response)
-            last = market.get("last_price_dollars") or market.get("yes_ask_dollars")
-            if last:
-                return Decimal(str(last))
-
-            return None
-        except Exception as e:
-            logger.error(f"Error getting mid price for {ticker}: {e}")
-            return None
-
-    def find_current_eth_15m_market(self) -> Optional[Dict[str, Any]]:
-        """
-        Find the current active 15-minute ETH market.
-
-        Looks for series KXETH15M (or similar) with status open.
-        Returns the market dict with soonest close_time.
-        """
-        try:
-            resp = self.list_markets(
-                status="open",
-                series_ticker="KXETH15M",
-                limit=100,
-            )
-            markets = resp.get("markets", [])
-
-            if not markets:
-                resp = self.list_markets(status="open", limit=200)
-                markets = [
-                    m for m in resp.get("markets", [])
-                    if "eth" in m.get("ticker", "").lower() and "15m" in m.get("ticker", "").lower()
-                ]
-
-            if not markets:
-                logger.warning("No ETH 15m markets found")
-                return None
-
-            now = datetime.now(timezone.utc)
-            active = []
-            for m in markets:
-                try:
-                    market_data = m.get("market", m) if isinstance(m, dict) and "market" in m else m
-                    status = (market_data.get("status") or "").lower()
-                    if status and status != "active":
-                        continue
-                    close_ts = market_data.get("close_time")
-                    if close_ts:
-                        close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
-                        if close_dt.tzinfo is None:
-                            close_dt = close_dt.replace(tzinfo=timezone.utc)
-                        if close_dt > now:
-                            active.append((close_dt, market_data))
-                except Exception:
-                    continue
-
-            if not active:
-                return None
-
-            active.sort(key=lambda x: x[0])
-            chosen = active[0][1]
-            logger.info(f"Current ETH 15m market: {chosen['ticker']} (closes {chosen.get('close_time')})")
-            return chosen
-
-        except Exception as e:
-            logger.error(f"Error finding ETH 15m market: {e}")
-            return None
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client."""
+        await self.http.aclose()
 
 
 # Singleton helper

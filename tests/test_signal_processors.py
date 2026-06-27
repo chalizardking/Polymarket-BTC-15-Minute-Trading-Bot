@@ -157,6 +157,32 @@ class TestOrderBookImbalanceProcessor:
         assert sig is not None
         assert sig.direction.value == "bullish"
 
+    def test_kalshi_orderbook_bid_heavy_bullish(self) -> None:
+        """Native Kalshi {'yes','no'} book via metadata['orderbook'] (Fix #6 path).
+
+        Exercises the real normalization branch: yes→bids, no→YES-ask at (1-p).
+        """
+        proc = OrderBookImbalanceProcessor(imbalance_threshold=0.30, min_book_volume=1.0, min_confidence=0.50)
+        kalshi_book = {
+            "yes": [[0.50, 1000], [0.49, 500]],   # heavy YES demand → bids
+            "no": [[0.49, 50]],                    # small NO demand → ask at 1-0.49=0.51
+        }
+        meta = {"orderbook": kalshi_book}
+        sig = proc.process(Decimal("0.50"), [], meta)
+        assert sig is not None
+        assert sig.direction.value == "bullish"
+
+    def test_kalshi_orderbook_balanced_no_signal(self) -> None:
+        """Native Kalshi book with equal YES/NO depth → no signal."""
+        proc = OrderBookImbalanceProcessor(imbalance_threshold=0.30, min_book_volume=1.0, min_confidence=0.50)
+        kalshi_book = {
+            "yes": [[0.50, 100]],   # bid USD: 0.50 * 100 = 50
+            "no": [[0.50, 100]],    # ask at 1-0.50=0.50, USD: 0.50 * 100 = 50
+        }
+        meta = {"orderbook": kalshi_book}
+        sig = proc.process(Decimal("0.50"), [], meta)
+        assert sig is None
+
 
 class TestDeribitPCRProcessor:
     def test_cache_hit_skips_fetch(self, monkeypatch):

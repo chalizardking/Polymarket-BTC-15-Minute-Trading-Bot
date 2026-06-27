@@ -1,64 +1,122 @@
 """Unit tests for KalshiClient (execution.kalshi_client)."""
 
+from collections.abc import Iterator
 from decimal import Decimal
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
+from _pytest.fixtures import FixtureRequest
 
 from execution.kalshi_client import KalshiClient
 
 
+@pytest.fixture(autouse=True)
+def _stub_async_client(request: FixtureRequest) -> Iterator[None]:
+    """Stop KalshiClient.__init__ from opening a real httpx.AsyncClient.
+
+    Without this, every constructed client leaks an unclosed AsyncClient.
+    The URL-join test needs a real transport, so it opts out and manages its
+    own client lifecycle.
+    """
+    if request.node.name == "test_request_resolves_full_url_with_base_path":
+        yield
+        return
+    stub_instance = MagicMock()
+    stub_instance.aclose = AsyncMock()
+    with patch("execution.kalshi_client.httpx.AsyncClient", return_value=stub_instance):
+        yield
+
+
 class TestKalshiClientBasics:
-    def test_init_demo_defaults(self):
+    def test_init_demo_defaults(self) -> None:
         client = KalshiClient(demo=True)
         assert client.demo is True
         assert "demo" in client.base_url
 
-    def test_init_prod_explicit(self):
+    def test_init_prod_explicit(self) -> None:
         client = KalshiClient(demo=False)
         assert client.demo is False
         assert "external-api" in client.base_url
 
-    @patch("execution.kalshi_client.requests.Session")
-    def test_request_success(self, mock_session_cls):
+    @pytest.mark.asyncio
+    @patch("execution.kalshi_client.httpx.AsyncClient")
+    async def test_request_success(self, mock_http_cls: MagicMock) -> None:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"ok": True}
         mock_resp.raise_for_status.return_value = None
 
-        mock_session = MagicMock()
-        mock_session.request.return_value = mock_resp
-        mock_session_cls.return_value = mock_session
+        mock_http = AsyncMock()
+        mock_http.request.return_value = mock_resp
+        mock_http_cls.return_value = mock_http
 
         client = KalshiClient(demo=True)
         # Force a non-auth path for simplicity
-        data = client._request("GET", "/markets", params={"limit": 1})
+        data = await client._request("GET", "/markets", params={"limit": 1})
 
         assert data == {"ok": True}
-        mock_session.request.assert_called_once()
+        mock_http.request.assert_called_once()
 
-    @patch("execution.kalshi_client.requests.Session")
-    def test_request_http_error_logs_and_raises(self, mock_session_cls):
-        # We only care that HTTP errors are surfaced; log format is secondary.
+    @pytest.mark.asyncio
+    async def test_request_resolves_full_url_with_base_path(self) -> None:
+        """A leading-slash path must append to the /trade-api/v2 base path.
+
+        Exercises the real httpx base_url join rather than just asserting the
+        awaited call, so a broken URL combination would actually fail here.
+        """
+        import httpx
+
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, json={"ok": True})
+
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        # Swap in a mock transport so we can inspect the resolved request URL.
+        await client.http.aclose()
+        client.http = httpx.AsyncClient(
+            base_url=client.base_url,
+            transport=httpx.MockTransport(handler),
+        )
+
+        try:
+            data = await client._request("GET", "/markets", params={"limit": 1})
+        finally:
+            await client.http.aclose()
+
+        assert data == {"ok": True}
+        assert (
+            captured["url"]
+            == "https://demo-api.kalshi.co/trade-api/v2/markets?limit=1"
+        )
+
+    @pytest.mark.asyncio
+    @patch("execution.kalshi_client.httpx.AsyncClient")
+    async def test_request_http_error_logs_and_raises(self, mock_http_cls: MagicMock) -> None:
+        import httpx
+
         mock_resp = MagicMock()
         mock_resp.status_code = 400
         mock_resp.text = "bad request"
-        from requests import HTTPError
-        mock_resp.raise_for_status.side_effect = HTTPError("400")
 
-        mock_session = MagicMock()
-        mock_session.request.return_value = mock_resp
-        mock_session_cls.return_value = mock_session
+        http_error = httpx.HTTPStatusError("400", request=MagicMock(), response=mock_resp)
+        mock_resp.raise_for_status.side_effect = http_error
+
+        mock_http = AsyncMock()
+        mock_http.request.return_value = mock_resp
+        mock_http_cls.return_value = mock_http
 
         client = KalshiClient(demo=True)
-        with pytest.raises(HTTPError):
-            client._request("GET", "/markets")
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._request("GET", "/markets")
 
-    def test_create_order_payload_formatting(self):
+    @pytest.mark.asyncio
+    async def test_create_order_payload_formatting(self) -> None:
         """Verify V2 payload uses top-level price and count as strings."""
         client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
         # We won't actually sign without a real key; patch _request to capture payload
-        with patch.object(client, "_request", return_value={"order_id": "x"}) as mock_req:
-            resp = client.create_order(
+        with patch.object(client, "_request", new_callable=AsyncMock, return_value={"order_id": "x"}) as mock_req:
+            resp = await client.create_order(
                 ticker="KXBTC15M-26JUN210800-00",
                 side="bid",
                 count=Decimal("1.52"),
@@ -79,3 +137,66 @@ class TestKalshiClientBasics:
             assert payload["client_order_id"] == "test-123"
             assert payload["time_in_force"] == "immediate_or_cancel"
             assert payload["self_trade_prevention_type"] == "taker_at_cross"
+
+
+class TestGetOrder:
+    @pytest.mark.asyncio
+    async def test_get_order_success(self) -> None:
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, return_value={"order": {"order_id": "abc", "status": "filled"}}) as mock_req:
+            result = await client.get_order("abc")
+            assert result == {"order_id": "abc", "status": "filled"}
+            mock_req.assert_called_once_with("GET", "/portfolio/orders/abc", require_auth=True)
+
+    @pytest.mark.asyncio
+    async def test_get_order_no_nesting(self) -> None:
+        """API sometimes returns flat dict without 'order' key."""
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, return_value={"order_id": "xyz", "status": "resting"}) as mock_req:
+            result = await client.get_order("xyz")
+            assert result == {"order_id": "xyz", "status": "resting"}
+
+    @pytest.mark.asyncio
+    async def test_get_order_404_returns_none(self) -> None:
+        """A genuine not-found (404) degrades to None."""
+        import httpx
+
+        resp = MagicMock()
+        resp.status_code = 404
+        http_error = httpx.HTTPStatusError("404", request=MagicMock(), response=resp)
+
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, side_effect=http_error):
+            result = await client.get_order("missing-id")
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_order_transient_http_error_raises(self) -> None:
+        """A non-404 HTTP error must surface, not be swallowed as None."""
+        import httpx
+
+        resp = MagicMock()
+        resp.status_code = 500
+        http_error = httpx.HTTPStatusError("500", request=MagicMock(), response=resp)
+
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, side_effect=http_error):
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.get_order("server-error-id")
+
+    @pytest.mark.asyncio
+    async def test_get_order_network_error_raises(self) -> None:
+        """A transport error must surface so callers can distinguish it from not-found."""
+        import httpx
+
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, side_effect=httpx.ConnectError("boom")):
+            with pytest.raises(httpx.RequestError):
+                await client.get_order("network-fail-id")
+
+    @pytest.mark.asyncio
+    async def test_get_order_non_dict_response_returns_none(self) -> None:
+        client = KalshiClient(demo=True, key_id="dummy", private_key_pem=None)
+        with patch.object(client, "_request", new_callable=AsyncMock, return_value="unexpected string"):
+            result = await client.get_order("weird-id")
+            assert result is None
