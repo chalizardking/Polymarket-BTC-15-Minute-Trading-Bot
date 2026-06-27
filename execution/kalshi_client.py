@@ -171,7 +171,13 @@ class KalshiClient:
                 json=json_body,
             )
             resp.raise_for_status()
-            data = resp.json()
+            # A successful empty body (e.g. 204 No Content from cancel_order)
+            # has nothing to parse — return an empty dict rather than letting
+            # resp.json() raise and turn a success into a failure.
+            if not resp.content:
+                data: Dict[str, Any] = {}
+            else:
+                data = resp.json()
             logger.trace(f"[Kalshi] {method} {path} -> {resp.status_code} ok")
             return data
         except httpx.HTTPStatusError as e:

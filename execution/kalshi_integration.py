@@ -334,6 +334,16 @@ class KalshiBTCIntegration:
                 price = current_price
                 label = "NO (DOWN)"
 
+            # Hard safety cap: live notional is fixed at $1.00 (see CLAUDE.md).
+            # Clamp here so any upstream bug can't place an oversized live order.
+            safe_size_usd = Decimal("1.00")
+            if Decimal(str(size_usd)) != safe_size_usd:
+                logger.warning(
+                    f"[LIVE] Overriding requested size ${float(size_usd):.2f} "
+                    f"to safety cap ${float(safe_size_usd):.2f}"
+                )
+            size_usd = safe_size_usd
+
             # Convert USD size to contract count for the side actually being bought.
             # The cost per contract is the price of the leg we are buying:
             #   LONG  → buying YES at `price`
@@ -714,8 +724,14 @@ class KalshiBTCIntegration:
                 )
                 if market:
                     status = market.get("status", "").lower()
-                    # Terminal statuses: settled, closed, or resolved all indicate market is done
-                    if status in ("settled", "closed", "resolved"):
+                    result = str(market.get("result", "")).lower()
+                    has_definitive_result = result in ("yes", "up", "no", "down")
+                    # Only settle on a definitive outcome. A market can report
+                    # status="closed" before it is actually resolved; treating that
+                    # as a settlement would book a phantom 0.0 loss and drop the
+                    # position. Require a settled/resolved status OR a definitive
+                    # result before accounting; otherwise keep tracking.
+                    if status in ("settled", "resolved") or has_definitive_result:
                         # Get the result - check for BTC UP or DOWN outcome
                         # Use `or 0` to guard against API returning null values
                         yes_bid_raw = market.get("yes_bid")
@@ -732,7 +748,6 @@ class KalshiBTCIntegration:
                         # Settlement: if YES outcome, exit_price = 1.0; if NO outcome, exit_price = 0.0
                         # For binary markets: settlement_price is the probability of YES at close
                         # We need to determine the final outcome
-                        result = str(market.get("result", "")).lower()
                         if result in ("yes", "up"):
                             exit_price = Decimal("1.0")  # YES won
                         elif result in ("no", "down"):
@@ -745,8 +760,11 @@ class KalshiBTCIntegration:
                         elif no_bid > 0:
                             exit_price = Decimal("1.0") - no_bid
                         else:
-                            exit_price = Decimal("0.0")
-                        
+                            # Terminal status but no result/bid data yet — don't
+                            # invent a 0.0 loss; leave the position tracked.
+                            logger.debug(f"Market {ticker} terminal but no definitive settlement price yet")
+                            continue
+
                         settled.append({
                             "client_order_id": client_order_id,
                             "order_id": pos["order_id"],

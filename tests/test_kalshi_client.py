@@ -1,14 +1,16 @@
 """Unit tests for KalshiClient (execution.kalshi_client)."""
 
+from collections.abc import Iterator
 from decimal import Decimal
 from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
+from _pytest.fixtures import FixtureRequest
 
 from execution.kalshi_client import KalshiClient
 
 
 @pytest.fixture(autouse=True)
-def _stub_async_client(request) -> None:
+def _stub_async_client(request: FixtureRequest) -> Iterator[None]:
     """Stop KalshiClient.__init__ from opening a real httpx.AsyncClient.
 
     Without this, every constructed client leaks an unclosed AsyncClient.
@@ -37,7 +39,7 @@ class TestKalshiClientBasics:
 
     @pytest.mark.asyncio
     @patch("execution.kalshi_client.httpx.AsyncClient")
-    async def test_request_success(self, mock_http_cls) -> None:
+    async def test_request_success(self, mock_http_cls: MagicMock) -> None:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"ok": True}
@@ -90,7 +92,7 @@ class TestKalshiClientBasics:
 
     @pytest.mark.asyncio
     @patch("execution.kalshi_client.httpx.AsyncClient")
-    async def test_request_http_error_logs_and_raises(self, mock_http_cls) -> None:
+    async def test_request_http_error_logs_and_raises(self, mock_http_cls: MagicMock) -> None:
         import httpx
 
         mock_resp = MagicMock()

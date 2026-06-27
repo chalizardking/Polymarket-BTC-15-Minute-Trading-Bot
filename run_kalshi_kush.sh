@@ -24,6 +24,17 @@ HEALTH_CHECK_INTERVAL=60
 
 mkdir -p "$LOG_DIR"
 
+# --- Fail fast on missing prerequisites (don't burn all retries on a
+#     misconfigured deploy) ---
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [SUPERVISOR] python3 not found in PATH" >&2
+    exit 1
+fi
+if [[ ! -f "$BOT_SCRIPT" || ! -r "$BOT_SCRIPT" ]]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [SUPERVISOR] Bot script not found or unreadable: $BOT_SCRIPT" >&2
+    exit 1
+fi
+
 # --- Trap signals ---
 cleanup() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [SUPERVISOR] Received signal — stopping bot gracefully"

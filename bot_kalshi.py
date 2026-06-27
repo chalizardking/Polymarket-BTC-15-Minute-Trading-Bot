@@ -486,8 +486,12 @@ class KalshiBTC15MinStrategy:
                 from data_sources.news_social.adapter import NewsSocialDataSource
                 ns = NewsSocialDataSource()
                 await ns.connect()
-                fg = await ns.get_fear_greed_index()
-                await ns.disconnect()
+                try:
+                    fg = await ns.get_fear_greed_index()
+                finally:
+                    # Always disconnect, even if the fetch raised, so this
+                    # long-running bot doesn't leak adapter connections/tasks.
+                    await ns.disconnect()
                 if fg and "value" in fg:
                     fg_val = float(fg["value"])
                     fg_entry = {"value_float": fg_val, "classification": fg.get("classification", "")}
@@ -506,8 +510,10 @@ class KalshiBTC15MinStrategy:
                 from data_sources.coinbase.adapter import CoinbaseDataSource
                 cb = CoinbaseDataSource()
                 await cb.connect()
-                spot = await cb.get_current_price()
-                await cb.disconnect()
+                try:
+                    spot = await cb.get_current_price()
+                finally:
+                    await cb.disconnect()
                 if spot:
                     meta["spot_price"] = float(spot)
                     self._cb_cache = (float(spot), time.time())
@@ -899,7 +905,7 @@ class KalshiBTC15MinStrategy:
         except Exception as e:
             logger.error(f"Grafana failed: {e}")
 
-    async def _resilient_price_feed(self):
+    async def _resilient_price_feed(self) -> None:
         """Wrapper that restarts the price feed if it dies unexpectedly.
 
         The inner start_price_feed already handles transient API errors with
@@ -927,15 +933,45 @@ class KalshiBTC15MinStrategy:
             # Exponential backoff for repeated crashes, capped at 60s
             feed_restart_delay = min(feed_restart_delay * 1.5, 60.0)
 
-    async def _self_restart(self):
+    async def _self_restart(self) -> None:
         """Reinitialize strategy state for a fresh 90-minute cycle.
 
         Preserves the Redis connection and Grafana but resets the timer,
         caches, and position tracking so the bot can continue without
         requiring an external process supervisor.
+
+        Transactional: a fresh integration is fully started BEFORE the old one
+        and its feed are torn down, so a failed restart leaves the existing
+        integration/feed intact rather than half-reset.
         """
         mode = "LIVE" if not self.simulation_mode else "SIM"
         logger.warning(f"[{mode}] ═══ SELF-RESTART: resetting state for fresh 90-min cycle ═══")
+
+        # Build and validate the replacement integration first; keep the current
+        # one untouched until we know the new one is good.
+        old_integration = self.integration
+        old_feed = getattr(self, "_price_feed_task", None)
+
+        import execution.kalshi_integration as ki
+        ki._integration_instance = None
+        new_integration = get_kalshi_integration(simulation_mode=self.simulation_mode)
+
+        ok = await new_integration.start()
+        if not ok:
+            logger.error(f"[{mode}] Self-restart failed: could not discover market — keeping current integration")
+            # Restore the singleton to the still-running integration.
+            ki._integration_instance = old_integration
+            return
+
+        # New integration is good — now tear down the old feed (which drives
+        # _on_price_update against the old state) before swapping state, so two
+        # feeds can't both schedule trades.
+        if old_feed is not None and not old_feed.done():
+            old_feed.cancel()
+            try:
+                await old_feed
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Reset timing
         self.bot_start_time = datetime.now(timezone.utc)
@@ -945,8 +981,8 @@ class KalshiBTC15MinStrategy:
         self._fg_cache = (None, 0.0)
         self._cb_cache = (None, 0.0)
 
-        # Reset market state
-        self.current_market_ticker = None
+        # Reset market state and swap in the new integration
+        self.integration = new_integration
         self._market_stable = False
         self._stable_tick_count = 0
         self.last_trade_key = None
@@ -954,33 +990,11 @@ class KalshiBTC15MinStrategy:
         self.price_history.clear()
         self._tick_buffer.clear()
 
-        # Clear integration singleton and get fresh instance
-        import execution.kalshi_integration as ki
-        ki._integration_instance = None
-        self.integration = get_kalshi_integration(simulation_mode=self.simulation_mode)
-
-        ok = await self.integration.start()
-        if not ok:
-            logger.error(f"[{mode}] Self-restart failed: could not discover market")
-            self._shutdown_requested = True
-            return
-
         self.current_market_ticker = self.integration.current_ticker
         snapshot = self.integration.get_market_snapshot()
         self._market_snapshot_version = snapshot.version if snapshot else 0
 
-        # Cancel the previous price-feed task and AWAIT its cancellation before
-        # starting a new one, so there's no window where two resilient feeds are
-        # both alive calling _on_price_update() and scheduling duplicate trades.
-        old_feed = getattr(self, "_price_feed_task", None)
-        if old_feed is not None and not old_feed.done():
-            old_feed.cancel()
-            try:
-                await old_feed
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Restart price feed through the resilient wrapper (Fix #4)
+        # Start the replacement price feed through the resilient wrapper (Fix #4)
         self._price_feed_task = asyncio.create_task(
             self._resilient_price_feed()
         )

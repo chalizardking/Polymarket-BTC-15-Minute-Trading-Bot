@@ -21,18 +21,18 @@ from execution.kalshi_integration import KalshiBTCIntegration, get_kalshi_integr
 
 
 class TestKalshiBTCIntegrationInit:
-    def test_init_simulation_mode(self):
+    def test_init_simulation_mode(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         assert integ.simulation_mode is True
         assert integ.current_ticker is None
 
-    def test_init_live_mode(self):
+    def test_init_live_mode(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         assert integ.simulation_mode is False
 
 
 class TestDiscoverAndQuotes:
-    def test_discover_current_market_success(self, mock_kalshi_client):
+    def test_discover_current_market_success(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         integ.client = mock_kalshi_client
 
@@ -45,7 +45,7 @@ class TestDiscoverAndQuotes:
         assert integ.current_market is not None
         assert integ.next_switch_time is not None
 
-    def test_get_latest_quote_after_price_update(self, mock_kalshi_client):
+    def test_get_latest_quote_after_price_update(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         integ.client = mock_kalshi_client
 
@@ -60,13 +60,13 @@ class TestDiscoverAndQuotes:
         assert quote["ask"] == Decimal("0.54")
         assert abs(float(quote["mid"]) - 0.50) < 0.0001
 
-    def test_get_current_price_none_initially(self):
+    def test_get_current_price_none_initially(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         assert integ.get_current_price() is None
 
 
 class TestPlaceTrade:
-    def test_place_trade_simulation(self):
+    def test_place_trade_simulation(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         integ.current_ticker = "KXBTC15M-TEST"
 
@@ -78,7 +78,7 @@ class TestPlaceTrade:
         assert order_id.startswith("sim_")
         assert integ.orders_placed >= 1
 
-    def test_place_trade_live_calls_client(self, mock_kalshi_client):
+    def test_place_trade_live_calls_client(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-LIVE"
@@ -99,7 +99,7 @@ class TestPlaceTrade:
         assert call_kwargs["side"] == "ask"
         assert float(call_kwargs["price"]) == 0.40
 
-    def test_place_trade_no_ticker_returns_none(self):
+    def test_place_trade_no_ticker_returns_none(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.current_ticker = None
 
@@ -112,7 +112,7 @@ class TestPlaceTrade:
 class TestPriceFeedBehavior:
     @pytest.mark.asyncio
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    async def test_price_feed_processes_orderbook_and_calls_callback(self, mock_sleep, mock_kalshi_client):
+    async def test_price_feed_processes_orderbook_and_calls_callback(self, mock_sleep, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-FEED"
@@ -145,14 +145,14 @@ class TestPriceFeedBehavior:
 
 
 class TestSingletonFactory:
-    def test_get_kalshi_integration_returns_same_instance(self):
+    def test_get_kalshi_integration_returns_same_instance(self) -> None:
         a = get_kalshi_integration(simulation_mode=True)
         b = get_kalshi_integration(simulation_mode=False)  # should still return cached
         assert a is b
 
 
 class TestPositionSettlement:
-    def test_check_and_settle_positions_reports_settled(self, mock_kalshi_client):
+    def test_check_and_settle_positions_reports_settled(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-SETTLED"
@@ -194,7 +194,7 @@ class TestIOCFillConfirmation:
     """Tests for the confirm_fill → _pending_confirmed_orders path added in Fix #2."""
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    def test_confirmed_fill_on_first_poll(self, mock_sleep, mock_kalshi_client):
+    def test_confirmed_fill_on_first_poll(self, mock_sleep, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-IOC"
@@ -218,7 +218,7 @@ class TestIOCFillConfirmation:
         assert result["confirmed_fill"] is True
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    def test_unconfirmed_fill_returns_none(self, mock_sleep, mock_kalshi_client):
+    def test_unconfirmed_fill_returns_none(self, mock_sleep, mock_kalshi_client) -> None:
         """An expired/canceled IOC must NOT be recorded as a position."""
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
@@ -242,7 +242,7 @@ class TestIOCFillConfirmation:
         assert "cli-ioc-2" not in integ._active_positions
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    def test_get_order_returns_none_throughout(self, mock_sleep, mock_kalshi_client):
+    def test_get_order_returns_none_throughout(self, mock_sleep, mock_kalshi_client) -> None:
         """If confirmation never succeeds, do not record the position."""
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
@@ -262,7 +262,7 @@ class TestIOCFillConfirmation:
         assert "cli-ioc-3" not in integ._active_positions
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    def test_confirmed_fill_tracked_in_active_positions(self, mock_sleep, mock_kalshi_client):
+    def test_confirmed_fill_tracked_in_active_positions(self, mock_sleep, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-IOC"
@@ -292,7 +292,7 @@ class TestIOCFillConfirmation:
 class TestAttemptExitPosition:
     """Tests for the new attempt_exit_position method (Fix #5: live exit)."""
 
-    def test_simulation_mode_returns_early(self):
+    def test_simulation_mode_returns_early(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=True)
         result = asyncio.run(
             integ.attempt_exit_position(
@@ -302,14 +302,14 @@ class TestAttemptExitPosition:
         )
         assert result["attempted"] is False
 
-    def test_invalid_position_returns_early(self):
+    def test_invalid_position_returns_early(self) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         result = asyncio.run(
             integ.attempt_exit_position({"ticker": None, "direction": None, "fill_quantity": Decimal("0")}, Decimal("0.5"))
         )
         assert result["attempted"] is False
 
-    def test_long_exit_uses_2pct_discount(self, mock_kalshi_client):
+    def test_long_exit_uses_2pct_discount(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
 
@@ -336,10 +336,14 @@ class TestAttemptExitPosition:
         # Price should be 0.50 * 0.98 = 0.49
         assert result["price"] == Decimal("0.49")
         assert result["side"] == "ask"
+        # Assert the order actually submitted matches (not just the echoed result)
+        exit_kwargs = mock_kalshi_client.create_order.call_args[1]
+        assert exit_kwargs["side"] == "ask"
+        assert float(exit_kwargs["price"]) == 0.49
         # Should be removed from active tracking
         assert "cli-orig" not in integ._active_positions
 
-    def test_short_exit_buys_yes_to_offset(self, mock_kalshi_client):
+    def test_short_exit_buys_yes_to_offset(self, mock_kalshi_client) -> None:
         """Closing a short means selling NO = buying YES → side='bid'.
 
         Reusing the entry side ('ask') would buy more NO and grow the short.
@@ -371,10 +375,14 @@ class TestAttemptExitPosition:
         # Closing a short buys YES; price 2% ABOVE mid to cross: 0.50 * 1.02 = 0.51
         assert result["side"] == "bid"
         assert result["price"] == Decimal("0.51")
+        # Assert the submitted order actually used side="bid" at the crossing price
+        exit_kwargs = mock_kalshi_client.create_order.call_args[1]
+        assert exit_kwargs["side"] == "bid"
+        assert float(exit_kwargs["price"]) == 0.51
         # Confirmed fill → removed from active tracking
         assert "cli-short-1" not in integ._active_positions
 
-    def test_partial_exit_reduces_tracked_quantity(self, mock_kalshi_client):
+    def test_partial_exit_reduces_tracked_quantity(self, mock_kalshi_client) -> None:
         """A partially filled exit decrements the tracked quantity, not removes it."""
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
@@ -402,7 +410,7 @@ class TestAttemptExitPosition:
         assert "cli-partial" in integ._active_positions
         assert integ._active_positions["cli-partial"]["fill_quantity"] == Decimal("1.5")
 
-    def test_order_rejected_returns_rejected(self, mock_kalshi_client):
+    def test_order_rejected_returns_rejected(self, mock_kalshi_client) -> None:
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         mock_kalshi_client.create_order.return_value = {"error": "insufficient_balance"}
@@ -427,7 +435,7 @@ class TestAttemptExitPosition:
 class TestRecordFillSizeUsd:
     """Verify record_fill respects the new size_usd parameter."""
 
-    def test_record_fill_uses_max_position_size_when_no_size_usd(self):
+    def test_record_fill_uses_max_position_size_when_no_size_usd(self) -> None:
         from execution.risk_engine import RiskEngine, reset_risk_engine
         reset_risk_engine()
         engine = RiskEngine()
@@ -443,7 +451,7 @@ class TestRecordFillSizeUsd:
         pos = engine._positions[pid]
         assert pos.current_size == Decimal("1.0")
 
-    def test_record_fill_uses_explicit_size_usd(self):
+    def test_record_fill_uses_explicit_size_usd(self) -> None:
         from execution.risk_engine import RiskEngine, reset_risk_engine
         reset_risk_engine()
         engine = RiskEngine()
@@ -459,7 +467,7 @@ class TestRecordFillSizeUsd:
         pos = engine._positions[pid]
         assert pos.current_size == Decimal("1.0")
 
-    def test_calculate_position_size_respects_max(self):
+    def test_calculate_position_size_respects_max(self) -> None:
         from execution.risk_engine import RiskEngine, reset_risk_engine
         reset_risk_engine()
         engine = RiskEngine()
