@@ -1,18 +1,40 @@
-# 🤖 Polymarket BTC 15-Minute Trading Bot
+# 🤖 Kalshi Kush — BTC 15-Minute Trading Bot
 
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-[![NautilusTrader](https://img.shields.io/badge/nautilus-1.222.0-green.svg)](https://nautilustrader.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Kalshi](https://img.shields.io/badge/Kalshi-KXBTC15M-blue)](https://kalshi.com)
 [![Polymarket](https://img.shields.io/badge/Polymarket-CLOB-purple)](https://polymarket.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Redis](https://img.shields.io/badge/Redis-powered-red.svg)](https://redis.io/)
 [![Grafana](https://img.shields.io/badge/Grafana-dashboard-orange)](https://grafana.com/)
 
-A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC price prediction markets**. Built with a 7-phase architecture combining multiple signal sources, professional risk management, and self-learning capabilities.
+**Kalshi Kush** is an algorithmic trading bot for **Kalshi's 15-minute BTC price markets** (`KXBTC15M`). It combines six signal processors with weighted fusion, conservative risk management ($1 max per trade), and paper/live modes.
 
+This repo also contains the **original Polymarket bot** it grew out of — the two share the signal processors, fusion engine, and risk engine. See [Entry Points](#entry-points) to pick one.
+
+---
+
+## 🚀 Entry Points
+
+**Kalshi Kush (primary):**
+```bash
+python bot_kalshi.py             # paper trading (safe default)
+python bot_kalshi.py --test-mode # trade every minute (testing)
+python bot_kalshi.py --live      # live trading on Kalshi (REAL MONEY)
+python bot_kalshi.py --demo      # force the Kalshi demo environment
+```
+
+**Polymarket (original):**
+```bash
+python bot.py                    # simulation
+python 15m_bot_runner.py --live  # live trading (REAL MONEY)
+```
+
+For the full Kalshi setup (auth, env vars, config) see [Kalshi Kush](#kalshi-kush). The sections below describe the shared architecture and the original Polymarket workflow.
 
 ---
 
 ## 📋 **Table of Contents**
+- [Entry Points](#entry-points)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
@@ -74,12 +96,11 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
     L -.-> F
 ```
 ## Prerequisites
-- Python 3.14+ (Download)
-
-- Redis (Download) - for mode switching
-
-- Polymarket Account with API credentials
+- Python 3.14+
 - Git
+- Redis (optional) — for runtime mode switching
+- **Kalshi Kush:** a Kalshi account with an API key ID + RSA private key (PEM)
+- **Polymarket (original bot):** a Polymarket account with API credentials
 
 ## 🚀 Quick Start
 
@@ -397,7 +418,7 @@ python bot_kalshi.py --no-grafana
 
 1. On startup the bot discovers the current active `KXBTC15M` market via `/markets`.
 2. A polling price feed pulls the order book every ~1s and feeds mid prices into the shared signal processors.
-3. Between 600–900 seconds (minutes 10–14) into the 15-min interval the bot evaluates fused signals + trend filter.
+3. Between 600–840 seconds (minutes 10–14) into the 15-min interval the bot evaluates fused signals + trend filter.
 4. If all gates pass, it submits a `bid` (buy YES) or `ask` (buy NO) order for $1 notional.
 5. Paper mode records simulated outcomes; live mode calls `create_order` on Kalshi.
 
