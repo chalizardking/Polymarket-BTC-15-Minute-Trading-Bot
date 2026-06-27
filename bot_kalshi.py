@@ -72,7 +72,8 @@ MARKET_INTERVAL_SECONDS = 900          # 15 minutes
 QUOTE_STABILITY_REQUIRED = 3
 QUOTE_MIN_SPREAD = 0.001
 TRADE_WINDOW_START = 600               # 10 minutes into the interval
-TRADE_WINDOW_END = 900                 # 15 minutes (exclusive) = through minute 14
+TRADE_WINDOW_END = 840                 # 14 minutes in; excludes the final no-edge
+                                       # minute and leaves a buffer before the roll
 
 TREND_UP_THRESHOLD = 0.60
 TREND_DOWN_THRESHOLD = 0.40
@@ -170,13 +171,16 @@ class KalshiBTC15MinStrategy:
             cache_seconds=300,
         )
 
-        # Fusion (reuse the same tuned weights)
+        # Fusion weights (match the documented scheme in CLAUDE.md). The
+        # OrderBookImbalance processor is the highest-weighted signal; before it
+        # was added here it was silently defaulting to 0.10.
         self.fusion_engine = get_fusion_engine()
-        self.fusion_engine.set_weight("TickVelocity", 0.36)
-        self.fusion_engine.set_weight("PriceDivergence", 0.24)
-        self.fusion_engine.set_weight("SpikeDetection", 0.18)
-        self.fusion_engine.set_weight("DeribitPCR", 0.14)
-        self.fusion_engine.set_weight("SentimentAnalysis", 0.08)
+        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
+        self.fusion_engine.set_weight("TickVelocity", 0.25)
+        self.fusion_engine.set_weight("PriceDivergence", 0.18)
+        self.fusion_engine.set_weight("SpikeDetection", 0.12)
+        self.fusion_engine.set_weight("DeribitPCR", 0.10)
+        self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
 
         # Risk + monitoring
         self.risk_engine = get_risk_engine()
@@ -343,6 +347,9 @@ class KalshiBTC15MinStrategy:
                 # Fast reconciliation of recently accepted IOC orders
                 reconciliation = self.integration.reconcile_pending_orders()
                 for pos in reconciliation["promoted"]:
+                    # Use the actual filled notional (cost basis × quantity) so a
+                    # partial fill doesn't get recorded as full $1 exposure.
+                    promoted_notional = Decimal(str(pos["fill_price"])) * Decimal(str(pos["fill_quantity"]))
                     position_id = self.risk_engine.record_fill(
                         order_id=pos["order_id"],
                         ticker=pos["ticker"],
@@ -350,7 +357,7 @@ class KalshiBTC15MinStrategy:
                         fill_price=pos["fill_price"],
                         fill_quantity=pos["fill_quantity"],
                         direction=pos["direction"],
-                        size_usd=POSITION_SIZE_USD,
+                        size_usd=promoted_notional,
                     )
                     logger.info(f"[{mode}] Promoted confirmed fill into risk engine: {position_id}")
 
@@ -496,7 +503,7 @@ class KalshiBTC15MinStrategy:
                     fg_val = float(fg["value"])
                     fg_entry = {"value_float": fg_val, "classification": fg.get("classification", "")}
                     meta["sentiment_score"] = fg_val
-                    meta["sentiment_classification"] = fg["classification"]
+                    meta["sentiment_classification"] = fg.get("classification", "")
                     self._fg_cache = (fg_entry, time.time())
             except Exception as e:
                 logger.debug(f"Fear&Greed unavailable: {e}")
@@ -800,6 +807,9 @@ class KalshiBTC15MinStrategy:
                 logger.info(f"[{mode}] LIVE ORDER ACCEPTED: order_id={order_id} confirmed_fill={confirmed_fill}")
 
                 if confirmed_fill and fill_quantity > 0:
+                    # Record the actual filled notional (cost basis × quantity);
+                    # a partial fill must not be tracked as full $1 exposure.
+                    filled_notional = Decimal(str(fill_price)) * Decimal(str(fill_quantity))
                     position_id = self.risk_engine.record_fill(
                         order_id=order_id,
                         ticker=market_ticker,
@@ -807,7 +817,7 @@ class KalshiBTC15MinStrategy:
                         fill_price=fill_price,
                         fill_quantity=fill_quantity,
                         direction=direction,
-                        size_usd=POSITION_SIZE_USD,
+                        size_usd=filled_notional,
                     )
                     logger.info(f"[{mode}] Position recorded in risk engine: {position_id}")
                 else:
@@ -963,6 +973,18 @@ class KalshiBTC15MinStrategy:
             ki._integration_instance = old_integration
             return
 
+        # Carry over any still-open positions so they remain monitored and
+        # settleable. The risk engine keeps its own records across restarts, so
+        # dropping these would orphan live exposure (and block new trades via the
+        # exposure limits) until manual intervention.
+        try:
+            carried = dict(getattr(old_integration, "_active_positions", {}))
+            if carried:
+                new_integration._active_positions.update(carried)
+                logger.warning(f"[{mode}] Carried {len(carried)} active position(s) into the new integration")
+        except Exception as e:
+            logger.error(f"[{mode}] Failed to carry over active positions on restart: {e}")
+
         # New integration is good — now tear down the old feed (which drives
         # _on_price_update against the old state) before swapping state, so two
         # feeds can't both schedule trades.
@@ -973,6 +995,15 @@ class KalshiBTC15MinStrategy:
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Close the previous integration's HTTP client so the old httpx.AsyncClient
+        # isn't leaked when we swap in the new integration.
+        try:
+            old_client = getattr(old_integration, "client", None)
+            if old_client is not None and hasattr(old_client, "aclose"):
+                await old_client.aclose()
+        except Exception as e:
+            logger.debug(f"[{mode}] Error closing old Kalshi client on restart: {e}")
+
         # Reset timing
         self.bot_start_time = datetime.now(timezone.utc)
         self._shutdown_requested = False
@@ -981,12 +1012,13 @@ class KalshiBTC15MinStrategy:
         self._fg_cache = (None, 0.0)
         self._cb_cache = (None, 0.0)
 
-        # Reset market state and swap in the new integration
+        # Reset market state and swap in the new integration. Position-monitor
+        # alert state is intentionally preserved (not cleared) so carried-over
+        # positions don't immediately re-alert.
         self.integration = new_integration
         self._market_stable = False
         self._stable_tick_count = 0
         self.last_trade_key = None
-        self._position_alerts.clear()
         self.price_history.clear()
         self._tick_buffer.clear()
 
@@ -1063,7 +1095,15 @@ def main():
     parser.add_argument("--live", action="store_true", help="Live trading (real money)")
     parser.add_argument("--no-grafana", action="store_true")
     parser.add_argument("--test-mode", action="store_true", help="Trade every minute")
+    parser.add_argument("--demo", action="store_true",
+                        help="Force the Kalshi demo environment even if KALSHI_DEMO=false")
     args = parser.parse_args()
+
+    # --demo forces the demo environment before any client is constructed
+    # (get_kalshi_client reads KALSHI_DEMO from the environment).
+    if args.demo:
+        import os
+        os.environ["KALSHI_DEMO"] = "true"
 
     simulation = not args.live
     if args.test_mode:

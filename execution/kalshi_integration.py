@@ -403,7 +403,12 @@ class KalshiBTCIntegration:
                 # would create phantom exposure and later trigger exit orders for
                 # contracts that were never filled. Note "resting" is NOT a fill
                 # for an IOC order — it either fills or cancels.
-                fill_price = price
+                #
+                # fill_price is stored as the COST BASIS of the leg we hold, which
+                # the risk engine and live-position monitor both expect:
+                #   LONG  → YES cost = price
+                #   SHORT → NO  cost = 1 - price   (we buy NO by selling YES at `price`)
+                fill_price = (Decimal("1.0") - price) if direction == "short" else price
                 fill_quantity = Decimal("0")
                 confirmed_fill = False
 
@@ -433,7 +438,11 @@ class KalshiBTCIntegration:
                                 # to the ordered count.
                                 fill_quantity = Decimal(str(count))
                             if filled_price is not None:
-                                fill_price = Decimal(str(filled_price))
+                                # The exchange reports the YES-side fill price (the
+                                # order used side="ask" at the YES price for shorts);
+                                # convert to the NO cost basis for short positions.
+                                fp = Decimal(str(filled_price))
+                                fill_price = (Decimal("1.0") - fp) if direction == "short" else fp
                             confirmed_fill = fill_quantity > 0
                             logger.info(
                                 f"[LIVE] ✓ IOC fill confirmed (poll {_poll_attempt + 1}/3): order_id={order_id} "

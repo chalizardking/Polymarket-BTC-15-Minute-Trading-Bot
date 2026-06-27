@@ -285,6 +285,34 @@ class TestIOCFillConfirmation:
         assert tracked["direction"] == "long"
         assert tracked["fill_price"] == Decimal("0.50")
 
+    @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
+    def test_short_fill_price_stored_as_no_cost(self, mock_sleep, mock_kalshi_client) -> None:
+        """A short stores its NO-side cost basis (1 - YES) as fill_price.
+
+        The risk engine and live-position monitor both treat entry_price as the
+        cost of the leg held; for a short that is the NO price.
+        """
+        integ = KalshiBTCIntegration(simulation_mode=False)
+        integ.client = mock_kalshi_client
+        integ.current_ticker = "KXBTC15M-IOC"
+
+        mock_kalshi_client.create_order.return_value = {"order": {"order_id": "ioc-short"}}
+        # Exchange reports the YES-side fill price (0.40) for a side="ask" short.
+        mock_kalshi_client.get_order.return_value = {
+            "order_id": "ioc-short",
+            "status": "filled",
+            "filled_count": 1.0,
+            "filled_price": 0.40,
+        }
+
+        async def _run():
+            return await integ.place_trade("short", Decimal("1.00"), Decimal("0.40"), client_order_id="cli-short")
+
+        result = asyncio.run(_run())
+        # NO cost basis = 1 - 0.40 = 0.60
+        assert result["fill_price"] == Decimal("0.60")
+        assert integ._active_positions["cli-short"]["fill_price"] == Decimal("0.60")
+
 
 # ── attempt_exit_position (Fix #5) ───────────────────────────────────
 
