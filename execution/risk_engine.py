@@ -247,8 +247,9 @@ class RiskEngine:
             logger.info(f"Capping position size from ${float(position_size):.2f} to ${float(max_size):.2f}")
             position_size = max_size
 
-        # Ensure at least $1 minimum
-        position_size = max(position_size, Decimal("1.0"))
+        # Ensure at least $1 minimum, but never above the cap (if max_position_size
+        # is ever configured below $1, the floor must not exceed it).
+        position_size = min(max(position_size, Decimal("1.0")), max_size)
         
         logger.info(
             f"Calculated position size: ${position_size:.2f} "

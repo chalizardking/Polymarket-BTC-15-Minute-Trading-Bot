@@ -142,10 +142,18 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
                 self._normalize_levels(book.get("asks", [])),
             )
         if "yes" in book or "no" in book:
-            return (
-                self._normalize_levels(book.get("yes", [])),
-                self._normalize_levels(book.get("no", [])),
-            )
+            # YES demand (buy-YES) maps directly to bids. A Kalshi buy-NO level
+            # at price p is a sell-YES level at (1 - p), so NO levels must be
+            # converted to YES-side ask prices before this processor values them
+            # as price * size — otherwise ask volume/walls are mispriced.
+            bids = self._normalize_levels(book.get("yes", []))
+            asks: List[Dict] = []
+            for level in self._normalize_levels(book.get("no", [])):
+                try:
+                    asks.append({"price": 1.0 - float(level["price"]), "size": level["size"]})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return bids, asks
         return [], []
 
     def _parse_levels(self, levels: List[Dict]) -> float:
@@ -196,7 +204,9 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         try:
             # --- Determine data source ---
             orderbook_data = metadata.get("orderbook")
-            if orderbook_data and isinstance(orderbook_data, dict):
+            if isinstance(orderbook_data, dict):
+                # A provided orderbook always takes precedence (even when empty),
+                # so an empty snapshot does not silently trigger a live fetch.
                 # Normalize so both Kalshi ({'yes','no'}) and CLOB
                 # ({'bids','asks'}) book shapes are accepted.
                 bids, asks = self._normalize_book(orderbook_data)

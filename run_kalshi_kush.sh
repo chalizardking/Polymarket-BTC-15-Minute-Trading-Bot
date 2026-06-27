@@ -64,7 +64,9 @@ while [[ $restart_count -lt $MAX_RESTARTS ]]; do
 
     if [[ $restart_count -ge $MAX_RESTARTS ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') [SUPERVISOR] Max restarts (${MAX_RESTARTS}) reached — giving up"
-        break
+        # Exit non-zero so an outer supervisor (launchd, systemd, etc.) can
+        # detect that restart supervision failed rather than seeing a clean exit.
+        exit 1
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [SUPERVISOR] Bot exited unexpectedly (code=${EXIT_CODE}) — restarting in ${RESTART_DELAY}s..."

@@ -327,7 +327,11 @@ class KalshiClient:
         return data.get("orders", [])
 
     async def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
-        """Get a single order by ID. Returns the order dict or None on error.
+        """Get a single order by ID.
+
+        Returns the order dict, None on a genuine 404/not-found, and re-raises
+        non-404 HTTP errors and transport failures so callers can distinguish a
+        missing order from a transient polling failure.
 
         Used for IOC fill confirmation: after placing an immediate_or_cancel
         order we poll this to confirm the actual fill quantity and price.

@@ -206,7 +206,10 @@ class KalshiBTC15MinStrategy:
         # Cache stores (value, timestamp); TTL enforced in _fetch_market_context.
         self._fg_cache: Tuple[Optional[dict], float] = (None, 0.0)
         self._cb_cache: Tuple[Optional[float], float] = (None, 0.0)
-        self._external_data_ttl = 300.0  # 5 minutes
+        self._external_data_ttl: float = 300.0  # 5 minutes
+
+        # Background price-feed task handle; cancelled/replaced on self-restart.
+        self._price_feed_task: Optional[asyncio.Task] = None
 
         if test_mode:
             logger.warning("=" * 80)
@@ -453,7 +456,7 @@ class KalshiBTC15MinStrategy:
         except Exception as e:
             logger.exception(f"[{mode}] _make_trading_decision crashed for {self.current_market_ticker} @ ${float(current_price):.4f}: {e}")
 
-    async def _fetch_market_context(self, current_price: Decimal) -> dict:
+    async def _fetch_market_context(self, current_price: Decimal, market_ticker: str) -> dict:
         """Fetch Coinbase spot + Fear & Greed (same as original)."""
         current = float(current_price)
         recent = [float(p) for p in self.price_history[-20:]]
@@ -511,15 +514,20 @@ class KalshiBTC15MinStrategy:
             except Exception as e:
                 logger.debug(f"Coinbase spot unavailable: {e}")
 
-        # Kalshi orderbook — feeds OrderBookImbalanceProcessor
-        if self.integration and getattr(self.integration, "current_ticker", None):
+        # Kalshi orderbook — feeds OrderBookImbalanceProcessor.
+        # Use the validated snapshot ticker (not the mutable current_ticker) so a
+        # market roll during the awaits above can't fuse this decision with the
+        # next market's book.
+        if self.integration and market_ticker:
             try:
-                book = await self.integration.client.get_orderbook(self.integration.current_ticker, depth=10)
+                book = await self.integration.client.get_orderbook(market_ticker, depth=10)
                 # Convert Kalshi {"yes": [[price,size],...], "no": [[price,size],...]}
-                # to processor format {"bids": [{"price","size"}...], "asks": [...]}
+                # to processor format {"bids": [{"price","size"}...], "asks": [...]}.
+                # A buy-NO level at price p is a sell-YES level at (1 - p), so NO
+                # prices are converted to YES-side ask prices for consistent valuation.
                 meta["orderbook"] = {
                     "bids": [{"price": str(p), "size": str(s)} for p, s in book.get("yes", [])],
-                    "asks": [{"price": str(p), "size": str(s)} for p, s in book.get("no", [])],
+                    "asks": [{"price": str(1.0 - float(p)), "size": str(s)} for p, s in book.get("no", [])],
                 }
             except Exception as e:
                 logger.debug(f"Kalshi orderbook unavailable: {e}")
@@ -548,7 +556,7 @@ class KalshiBTC15MinStrategy:
             )
             return False
 
-        metadata = await self._fetch_market_context(current_price)
+        metadata = await self._fetch_market_context(current_price, market_ticker)
 
         # Run all processors (identical calls)
         signals = []
@@ -706,13 +714,17 @@ class KalshiBTC15MinStrategy:
         else:
             exit_p = Decimal("0.0") if settle_yes else Decimal("1.0")
 
-        # P&L for binary options: contracts = size / order_price, profit = contracts * (payout - order_price)
+        # P&L for binary options: contracts = size / order_price, profit = contracts * (payout - order_price).
+        # exit_p already encodes the settlement value of the leg we hold (1 if our
+        # side won, else 0 — see the direction-aware assignment above), so payout
+        # is exit_p for both long and short. Only the entry cost differs:
+        #   long  → bought YES at `price`
+        #   short → bought NO  at (1 - price)
         if direction == "long":
             order_price = price
-            payout = exit_p
         else:
             order_price = Decimal("1.0") - price
-            payout = Decimal("1.0") - exit_p
+        payout = exit_p
         pnl = size * (payout - order_price) / order_price
         outcome = "WIN" if pnl > 0 else "LOSS"
 
@@ -957,12 +969,16 @@ class KalshiBTC15MinStrategy:
         snapshot = self.integration.get_market_snapshot()
         self._market_snapshot_version = snapshot.version if snapshot else 0
 
-        # Cancel the previous price-feed task before starting a new one, so we
-        # don't leave two resilient feeds alive both calling _on_price_update()
-        # and scheduling duplicate trades.
+        # Cancel the previous price-feed task and AWAIT its cancellation before
+        # starting a new one, so there's no window where two resilient feeds are
+        # both alive calling _on_price_update() and scheduling duplicate trades.
         old_feed = getattr(self, "_price_feed_task", None)
         if old_feed is not None and not old_feed.done():
             old_feed.cancel()
+            try:
+                await old_feed
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Restart price feed through the resilient wrapper (Fix #4)
         self._price_feed_task = asyncio.create_task(

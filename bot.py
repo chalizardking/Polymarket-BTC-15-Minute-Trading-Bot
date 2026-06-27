@@ -705,7 +705,7 @@ class IntegratedBTCStrategy(Strategy):
             trade_key = (market_start_ts, sub_interval)
 
             # =========================================================================
-            # TRADE WINDOW: minutes 10–14 of each 15-min market (600–840 seconds in)
+            # TRADE WINDOW: minutes 10–14 of each 15-min market (600–900 seconds in)
             #
             # WHY LATE IN THE MARKET:
             #   By 10 minutes in, the UP/DOWN result is already late-stage. The price IS
@@ -728,7 +728,7 @@ class IntegratedBTCStrategy(Strategy):
             # =========================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
             TRADE_WINDOW_START = 600   # 10 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
+            TRADE_WINDOW_END   = 900   # 15 minutes (exclusive) = through minute 14
 
             if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key

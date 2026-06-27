@@ -303,6 +303,18 @@ class KalshiBTCIntegration:
             return f"sim_{uuid.uuid4().hex[:8]}"
 
         try:
+            # Guard inputs before deriving a live order: an unexpected direction
+            # must not silently fall through to the short branch and place a NO
+            # trade, and the price must be a valid probability in (0, 1).
+            if direction not in ("long", "short"):
+                logger.error(f"[LIVE] Invalid trade direction: {direction!r} — refusing to place order")
+                self.orders_rejected += 1
+                return None
+            if not (Decimal("0") < Decimal(str(current_price)) < Decimal("1")):
+                logger.error(f"[LIVE] Invalid Kalshi price {current_price} for {direction} — refusing to place order")
+                self.orders_rejected += 1
+                return None
+
             # Determine side and price.
             #
             # Kalshi V2 semantics:
@@ -650,7 +662,14 @@ class KalshiBTCIntegration:
         for client_order_id, pos in list(self._active_positions.items()):
             ticker = pos["ticker"]
             try:
-                market = await self.client.get_market(ticker)
+                market_resp = await self.client.get_market(ticker)
+                # Kalshi V2 nests the market under a "market" key; unwrap it so
+                # status/yes_bid/no_bid are read from the right level.
+                market = (
+                    market_resp.get("market", market_resp)
+                    if isinstance(market_resp, dict)
+                    else {}
+                )
                 if market:
                     status = market.get("status", "").lower()
                     # Terminal statuses: settled, closed, or resolved all indicate market is done
@@ -661,7 +680,13 @@ class KalshiBTCIntegration:
                         no_bid_raw = market.get("no_bid")
                         yes_bid = Decimal(str(yes_bid_raw)) if yes_bid_raw is not None else Decimal("0")
                         no_bid = Decimal(str(no_bid_raw)) if no_bid_raw is not None else Decimal("0")
-                        
+                        # Kalshi market bids often arrive in cents (0–100); normalize
+                        # to a 0–1 probability before using them as exit prices.
+                        if yes_bid > 1:
+                            yes_bid /= Decimal("100")
+                        if no_bid > 1:
+                            no_bid /= Decimal("100")
+
                         # Settlement: if YES outcome, exit_price = 1.0; if NO outcome, exit_price = 0.0
                         # For binary markets: settlement_price is the probability of YES at close
                         # We need to determine the final outcome
