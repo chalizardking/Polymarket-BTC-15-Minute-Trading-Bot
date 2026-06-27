@@ -374,6 +374,34 @@ class TestAttemptExitPosition:
         # Confirmed fill → removed from active tracking
         assert "cli-short-1" not in integ._active_positions
 
+    def test_partial_exit_reduces_tracked_quantity(self, mock_kalshi_client):
+        """A partially filled exit decrements the tracked quantity, not removes it."""
+        integ = KalshiBTCIntegration(simulation_mode=False)
+        integ.client = mock_kalshi_client
+        integ._active_positions["cli-partial"] = {
+            "ticker": "KXBTC15M-EXIT",
+            "direction": "long",
+            "fill_quantity": Decimal("2"),
+            "fill_price": Decimal("0.50"),
+            "order_id": "orig-order-3",
+            "client_order_id": "cli-partial",
+        }
+
+        mock_kalshi_client.create_order.return_value = {"order": {"order_id": "exit-order-3"}}
+        mock_kalshi_client.get_order.return_value = {
+            "order_id": "exit-order-3",
+            "status": "partially_filled",
+            "filled_count": 0.5,
+        }
+
+        pos = integ._active_positions["cli-partial"]
+        result = asyncio.run(integ.attempt_exit_position(pos, Decimal("0.50")))
+        assert result["attempted"] is True
+        assert result["accepted"] is True
+        # Still tracked, with remaining = 2 - 0.5 = 1.5
+        assert "cli-partial" in integ._active_positions
+        assert integ._active_positions["cli-partial"]["fill_quantity"] == Decimal("1.5")
+
     def test_order_rejected_returns_rejected(self, mock_kalshi_client):
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client

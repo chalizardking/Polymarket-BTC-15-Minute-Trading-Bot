@@ -7,6 +7,23 @@ import pytest
 from execution.kalshi_client import KalshiClient
 
 
+@pytest.fixture(autouse=True)
+def _stub_async_client(request) -> None:
+    """Stop KalshiClient.__init__ from opening a real httpx.AsyncClient.
+
+    Without this, every constructed client leaks an unclosed AsyncClient.
+    The URL-join test needs a real transport, so it opts out and manages its
+    own client lifecycle.
+    """
+    if request.node.name == "test_request_resolves_full_url_with_base_path":
+        yield
+        return
+    stub_instance = MagicMock()
+    stub_instance.aclose = AsyncMock()
+    with patch("execution.kalshi_client.httpx.AsyncClient", return_value=stub_instance):
+        yield
+
+
 class TestKalshiClientBasics:
     def test_init_demo_defaults(self) -> None:
         client = KalshiClient(demo=True)
@@ -60,7 +77,10 @@ class TestKalshiClientBasics:
             transport=httpx.MockTransport(handler),
         )
 
-        data = await client._request("GET", "/markets", params={"limit": 1})
+        try:
+            data = await client._request("GET", "/markets", params={"limit": 1})
+        finally:
+            await client.http.aclose()
 
         assert data == {"ok": True}
         assert (

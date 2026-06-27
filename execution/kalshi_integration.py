@@ -615,6 +615,7 @@ class KalshiBTCIntegration:
             if exit_order_id:
                 # Confirm fill on the exit order — poll up to 3 times
                 status = "unknown"
+                exit_filled_qty = Decimal("0")
                 for _poll_attempt in range(3):
                     await asyncio.sleep(0.2)
                     try:
@@ -627,27 +628,47 @@ class KalshiBTCIntegration:
                         continue
                     if detail:
                         status = str(detail.get("status", "")).lower()
-                        if status in ("filled", "resting", "matched"):
+                        filled_raw = detail.get("filled_count") or detail.get("filled")
+                        if filled_raw is not None:
+                            exit_filled_qty = Decimal(str(filled_raw))
+                        if status in ("filled", "matched", "partially_filled"):
                             break
-                        elif status in ("canceled", "cancelled", "expired"):
+                        elif status in ("canceled", "cancelled", "expired", "resting"):
                             break
-                # Only a real fill closes the position. An IOC that comes back
-                # canceled/expired/partial/live leaves exposure on the book, so we
-                # must keep tracking it rather than silently dropping it.
-                filled = status in ("filled", "matched")
-                accepted = filled
+
+                cli_id = position.get("client_order_id", "")
+                fully_filled = status in ("filled", "matched")
+                # A partial fill reduces remaining exposure; anything else
+                # (canceled/expired/resting/unknown) leaves exposure on the book,
+                # so we keep tracking it rather than silently dropping it.
+                if not fully_filled and status == "partially_filled" and exit_filled_qty <= 0:
+                    # Reported partial but no quantity — treat as unconfirmed.
+                    status = "partial_unconfirmed"
+                accepted = fully_filled or (status == "partially_filled" and exit_filled_qty > 0)
 
                 logger.info(
                     f"[LIVE] Exit order placed: exit_order_id={exit_order_id} "
-                    f"status={status} filled={filled} original_order_id={order_id}"
+                    f"status={status} filled_qty={exit_filled_qty} original_order_id={order_id}"
                 )
 
-                if filled:
-                    self._active_positions.pop(position.get("client_order_id", ""), None)
+                if fully_filled:
+                    self._active_positions.pop(cli_id, None)
+                elif status == "partially_filled" and exit_filled_qty > 0:
+                    tracked = self._active_positions.get(cli_id)
+                    remaining = fill_quantity - exit_filled_qty
+                    if tracked is None or remaining <= 0:
+                        # Nothing left to track (or no record) — drop it.
+                        self._active_positions.pop(cli_id, None)
+                    else:
+                        tracked["fill_quantity"] = remaining
+                        logger.warning(
+                            f"[LIVE] Exit partially filled ({exit_filled_qty}/{fill_quantity}) — "
+                            f"reduced tracked position {cli_id} to {remaining} remaining"
+                        )
                 else:
                     logger.warning(
                         f"[LIVE] Exit not confirmed filled (status={status}) — keeping "
-                        f"position {position.get('client_order_id', '')} in active tracking"
+                        f"position {cli_id} in active tracking"
                     )
 
                 return {
@@ -657,6 +678,7 @@ class KalshiBTCIntegration:
                     "side": side,
                     "price": price,
                     "count": fill_quantity,
+                    "filled_count": exit_filled_qty,
                     "reason": f"exit_status={status}",
                 }
             else:
