@@ -102,17 +102,16 @@ source venv/bin/activate
 ```
 ## 3. Install Dependencies
 
-```
-bash
+```bash
 pip install -r requirements.txt
 ```
 ## 4. Configure Environment Variables
-```
-bash
+```bash
 cp .env.example .env
-Edit .env with your credentials:
+```
+Edit `.env` with your credentials:
 
-env
+```env
 # Polymarket API Credentials
 POLYMARKET_PK=your_private_key_here
 POLYMARKET_API_KEY=your_api_key_here
@@ -132,8 +131,7 @@ SPIKE_THRESHOLD=0.15
 DIVERGENCE_THRESHOLD=0.05
 ```
 ## 5. Start Redis
-```
-bash
+```bash
 # Windows (download from redis.io)
 redis-server
 
@@ -146,35 +144,34 @@ sudo apt install redis-server
 redis-server
 ```
 ## 6. Run the Bot
-```
-bash
-# Test mode (trades every minute - for quick testing)
-python run_bot.py --test-mode
+```bash
+# Simulation mode (safe, default)
+python bot.py
 
 # Live trading mode (REAL MONEY!)
 python 15m_bot_runner.py --live
 ```
 ## ⚙️ Configuration Options
-Argument	Description	Default
---test-mode	Trade every minute for testing	False
---live	Enable live trading (real money)	False
---no-grafana	Disable Grafana metrics	False
-##View Paper Trades
-```
-bash
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--test-mode` | Trade every minute for testing | False |
+| `--live` | Enable live trading (real money) | False |
+| `--no-grafana` | Disable Grafana metrics | False |
+
+## View Paper Trades
+```bash
 python view_paper_trades.py
 ```
 ## Trading Modes
-Switch Modes Without Restarting (Redis)
+Switch modes without restarting (Redis):
 
+```bash
 # Switch to simulation mode (safe)
-```
-python redis_control.py sim -- not stable yet
-```
+python redis_control.py sim    # not stable yet
+
 # Switch to live trading mode (REAL MONEY!)
+python redis_control.py live   # not stable yet
 ```
-python redis_control.py live --not stable yet
-``` 
 ## 📁 Project Structure
 
 ```text
@@ -203,6 +200,8 @@ polymarket-btc-15m-bot/
 ├── execution/                   # Phase 5: Order placement & risk control
 │   ├── execution_engine.py      # Main order execution coordinator
 │   ├── polymarket_client.py     # Polymarket API wrapper & order logic
+│   ├── kalshi_client.py         # Kalshi RSA-PSS auth + async REST wrapper
+│   ├── kalshi_integration.py    # Kalshi market discovery, polling, orders
 │   └── risk_engine.py           # Position sizing, SL/TP, exposure limits
 │
 ├── monitoring/                  # Phase 6: Performance tracking & metrics
@@ -217,45 +216,41 @@ polymarket-btc-15m-bot/
 │   ├── grafana.ini              # Grafana server config (optional)
 │   └── import_dashboard.py      # Script to import dashboard automatically
 │
-├── scripts/                     # Development & testing utilities
-│   ├── test_data_sources.py
-│   ├── test_ingestion.py
-│   ├── test_nautilus.py
-│   ├── test_strategy.py
-│   └── test_execution.py
+├── tests/                       # Pytest suite (run with `pytest tests/ -v`)
 │
 ├── .env.example                 # Template for environment variables
 ├── .gitignore
 ├── patch_gamma_markets.py       # Temporary patch/fix for Polymarket API
 ├── redis_control.py             # Switch trading mode (sim/live/test)
 ├── requirements.txt             # Python dependencies
-├── run_bot.py                   # Main bot entry point
+├── bot.py                       # Polymarket entry point (simulation)
+├── 15m_bot_runner.py            # Polymarket live runner (--live)
+├── bot_kalshi.py                # Kalshi Kush entry point (sim/live/demo)
 ├── view_paper_trades.py         # View simulation/paper trade history
 └── README.md                    # This file
 ```
-Testing
-Run tests for each phase independently:
+## Testing
+Run the full pytest suite:
 
-# Test individual phases
+```bash
+pytest tests/ -v
 ```
-python scripts/test_data_sources.py
-python scripts/test_ingestion.py
-python scripts/test_nautilus.py
-python scripts/test_strategy.py
-python scripts/test_execution.py
+
+Phase-specific smoke tests (co-located with each phase):
+
+```bash
+python core/strategy_brain/test_strategy.py   # Signal processors
+python core/ingestion/test_ingestion.py        # Data ingestion
+python execution/test_execution.py             # Order execution + risk
 ```
-🤝 Contributing
+## 🤝 Contributing
 Contributions are welcome! Here's how you can help:
 
- - Fork the repository
-
- - Create a feature branch: git checkout -b feature
-
- -Commit your changes: git commit -m 'Added feature'
-
-- Push to the branch: git push origin feature/added-feature
-
-Open a Pull Request
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes: `git commit -m 'Add feature'`
+4. Push to the branch: `git push origin feature/my-feature`
+5. Open a Pull Request
 
 ## Ideas for Contributions
 - Add derivatives data (funding rates, open interest)
