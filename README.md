@@ -402,7 +402,7 @@ python bot_kalshi.py --no-grafana
 
 1. On startup the bot discovers the current active `KXBTC15M` market via `/markets`.
 2. A polling price feed pulls the order book every ~1s and feeds mid prices into the shared signal processors.
-3. Between 780–840 seconds into the 15-min interval the bot evaluates fused signals + trend filter.
+3. Between 600–840 seconds into the 15-min interval the bot evaluates fused signals + trend filter.
 4. If all gates pass, it submits a `bid` (buy YES) or `ask` (buy NO) order for $1 notional.
 5. Paper mode records simulated outcomes; live mode calls `create_order` on Kalshi.
 

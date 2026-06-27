@@ -157,6 +157,29 @@ class TestOrderBookImbalanceProcessor:
         assert sig is not None
         assert sig.direction.value == "bullish"
 
+    def test_kalshi_orderbook_bid_heavy_bullish(self):
+        """Kalshi-format orderbook via metadata['orderbook'] (Fix #6 path)."""
+        proc = OrderBookImbalanceProcessor(imbalance_threshold=0.30, min_book_volume=1.0, min_confidence=0.50)
+        kalshi_book = {
+            "bids": [{"price": "0.50", "size": "1000"}, {"price": "0.49", "size": "500"}],
+            "asks": [{"price": "0.51", "size": "50"}],
+        }
+        meta = {"orderbook": kalshi_book}
+        sig = proc.process(Decimal("0.50"), [], meta)
+        assert sig is not None
+        assert sig.direction.value == "bullish"
+
+    def test_kalshi_orderbook_balanced_no_signal(self):
+        """Kalshi-format orderbook with equal depth → no signal."""
+        proc = OrderBookImbalanceProcessor(imbalance_threshold=0.30, min_book_volume=1.0, min_confidence=0.50)
+        kalshi_book = {
+            "bids": [{"price": "0.50", "size": "100"}],
+            "asks": [{"price": "0.51", "size": "100"}],
+        }
+        meta = {"orderbook": kalshi_book}
+        sig = proc.process(Decimal("0.50"), [], meta)
+        assert sig is None
+
 
 class TestDeribitPCRProcessor:
     def test_cache_hit_skips_fetch(self, monkeypatch):

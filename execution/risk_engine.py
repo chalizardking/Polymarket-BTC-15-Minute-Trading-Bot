@@ -65,7 +65,7 @@ class RiskEngine:
         Args:
             limits: Risk limits configuration
         """
-        # Default conservative limits with $1 max per trade
+        # Default conservative limits — $1 max per trade (hard safety cap, see CLAUDE.md)
         self.limits = limits or RiskLimits(
             max_position_size=Decimal("1.0"),  # $1 max per position
             max_total_exposure=Decimal("10.0"),  # $10 total
@@ -146,13 +146,14 @@ class RiskEngine:
         fill_price: Decimal,
         fill_quantity: Decimal,
         direction: str,
+        size_usd: Optional[Decimal] = None,
     ) -> str:
         """
         Record a filled order as an open position.
-        
+
         Called when Kalshi IOC order fills. Position is tracked under order_id
         so it can be closed when the market settles.
-        
+
         Args:
             order_id: Unique order identifier from Kalshi
             ticker: Market ticker (e.g., "KXBTC15M-XXX")
@@ -160,12 +161,13 @@ class RiskEngine:
             fill_price: The price at which the order filled
             fill_quantity: Number of contracts filled
             direction: "long" (YES) or "short" (NO)
-            
+            size_usd: Position size in USD (defaults to max_position_size if None)
+
         Returns:
             Position ID for tracking
         """
         # Calculate position size in USD
-        position_size = Decimal("1.00")  # Fixed at $1 in kalshi_kush
+        position_size = size_usd if size_usd is not None else self.limits.max_position_size
         
         position_id = f"{ticker}-{order_id}"
         
@@ -239,12 +241,13 @@ class RiskEngine:
         # Calculate position size
         position_size = risk_amount * strength_multiplier
         
-        # ENFORCE $1 MAXIMUM
-        if position_size > Decimal("1.0"):
-            logger.info(f"Capping position size from ${float(position_size):.2f} to $1.00")
-            position_size = Decimal("1.0")
-        
-        # Ensure at least $1 (for simulation, in live you might want higher minimum)
+        # ENFORCE MAXIMUM (matches RiskLimits.max_position_size)
+        max_size = self.limits.max_position_size
+        if position_size > max_size:
+            logger.info(f"Capping position size from ${float(position_size):.2f} to ${float(max_size):.2f}")
+            position_size = max_size
+
+        # Ensure at least $1 minimum
         position_size = max(position_size, Decimal("1.0"))
         
         logger.info(
@@ -319,10 +322,15 @@ class RiskEngine:
         # Calculate P&L
         direction = position.metadata.get("direction", "long")
         
+        # Binary option unrealized P&L: contracts = size / order_price
+        # For long:  order_price = YES price (entry_price), current_value = current_price (YES mid)
+        # For short: order_price = NO price (entry_price), current_value = (1-current_price) (NO mid)
+        order_price = position.entry_price
         if direction == "long":
-            pnl_pct = (current_price - position.entry_price) / position.entry_price
-        else:  # short
-            pnl_pct = (position.entry_price - current_price) / position.entry_price
+            current_value = current_price
+        else:
+            current_value = Decimal("1.0") - current_price
+        pnl_pct = (current_value - order_price) / order_price if order_price > 0 else Decimal("0")
         
         position.unrealized_pnl = position.current_size * pnl_pct
         
@@ -360,7 +368,7 @@ class RiskEngine:
         
         Args:
             position_id: Position ID
-            exit_price: Exit price
+            exit_price: Exit price (YES side for both long and short)
             
         Returns:
             Realized P&L or None
@@ -373,10 +381,15 @@ class RiskEngine:
         # Calculate final P&L
         direction = position.metadata.get("direction", "long")
         
+        # Binary option P&L: contracts = size / order_price, profit = contracts * (payout - order_price)
+        # For long:  order_price = YES price (entry_price), payout = exit_price (YES settlement)
+        # For short: order_price = NO price (entry_price), payout = (1-exit_price) (NO settlement)
+        order_price = position.entry_price
         if direction == "long":
-            pnl_pct = (exit_price - position.entry_price) / position.entry_price
+            payout = exit_price
         else:
-            pnl_pct = (position.entry_price - exit_price) / position.entry_price
+            payout = Decimal("1.0") - exit_price
+        pnl_pct = (payout - order_price) / order_price if order_price > 0 else Decimal("0")
         
         realized_pnl = position.current_size * pnl_pct
         

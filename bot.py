@@ -705,10 +705,10 @@ class IntegratedBTCStrategy(Strategy):
             trade_key = (market_start_ts, sub_interval)
 
             # =========================================================================
-            # TRADE WINDOW: minutes 13–14 of each 15-min market (780–840 seconds in)
+            # TRADE WINDOW: minutes 10–14 of each 15-min market (600–840 seconds in)
             #
             # WHY LATE IN THE MARKET:
-            #   At 13 minutes in, the UP/DOWN result is nearly decided. The price IS
+            #   By 10 minutes in, the UP/DOWN result is already late-stage. The price IS
             #   the trend — if YES is at $0.78, BTC went up during this interval.
             #   We're not predicting anymore, we're reading a nearly-resolved outcome.
             #
@@ -727,7 +727,7 @@ class IntegratedBTCStrategy(Strategy):
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
+            TRADE_WINDOW_START = 600   # 10 minutes in
             TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
 
             if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:

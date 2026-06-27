@@ -87,4 +87,4 @@ REDIS_DB=2
 
 ## Trading Logic
 
-The bot trades only in the late window (13-14 minutes into each 15-min interval). It applies a trend filter (price > 0.60 → buy YES/bid, price < 0.40 → buy NO/ask) to the fused signal before execution. Position size is hard-coded to $1.00 for safety.
+The bot trades only in the late window (10-14 minutes into each 15-min interval). It applies a trend filter (price > 0.60 → buy YES/bid, price < 0.40 → buy NO/ask) to the fused signal before execution. Position size is hard-coded to $1.00 for safety.
