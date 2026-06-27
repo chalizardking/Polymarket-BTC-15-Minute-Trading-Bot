@@ -218,7 +218,8 @@ class TestIOCFillConfirmation:
         assert result["confirmed_fill"] is True
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
-    def test_unconfirmed_fill_falls_back_to_optimistic(self, mock_sleep, mock_kalshi_client):
+    def test_unconfirmed_fill_returns_none(self, mock_sleep, mock_kalshi_client):
+        """An expired/canceled IOC must NOT be recorded as a position."""
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-IOC"
@@ -226,23 +227,23 @@ class TestIOCFillConfirmation:
         mock_kalshi_client.create_order.return_value = {
             "order": {"order_id": "ioc-order-2"},
         }
-        # get_order always returns status=expired
+        # get_order always returns status=expired → no fill
         mock_kalshi_client.get_order.return_value = {
             "order_id": "ioc-order-2",
             "status": "expired",
         }
 
         async def _run():
-            return await integ.place_trade("long", Decimal("1.00"), Decimal("0.50"))
+            return await integ.place_trade("long", Decimal("1.00"), Decimal("0.50"), client_order_id="cli-ioc-2")
 
         result = asyncio.run(_run())
-        assert result is not None
-        assert result["confirmed_fill"] is False
-        # Falls back to optimistic: size_usd / price = 1.00 / 0.50 = 2.0
-        assert result["fill_quantity"] == Decimal("2.0")
+        # No confirmed fill → returns None and tracks nothing (no phantom exposure)
+        assert result is None
+        assert "cli-ioc-2" not in integ._active_positions
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
     def test_get_order_returns_none_throughout(self, mock_sleep, mock_kalshi_client):
+        """If confirmation never succeeds, do not record the position."""
         integ = KalshiBTCIntegration(simulation_mode=False)
         integ.client = mock_kalshi_client
         integ.current_ticker = "KXBTC15M-IOC"
@@ -253,12 +254,12 @@ class TestIOCFillConfirmation:
         mock_kalshi_client.get_order.return_value = None
 
         async def _run():
-            return await integ.place_trade("long", Decimal("1.00"), Decimal("0.50"))
+            return await integ.place_trade("long", Decimal("1.00"), Decimal("0.50"), client_order_id="cli-ioc-3")
 
         result = asyncio.run(_run())
-        assert result is not None
-        # All polls returned None → optimistic default: confirmed_fill stays True
-        assert result["confirmed_fill"] is True
+        # All polls returned None → unconfirmed → not recorded
+        assert result is None
+        assert "cli-ioc-3" not in integ._active_positions
 
     @patch("execution.kalshi_integration.asyncio.sleep", new_callable=AsyncMock)
     def test_confirmed_fill_tracked_in_active_positions(self, mock_sleep, mock_kalshi_client):

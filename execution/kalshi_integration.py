@@ -387,9 +387,15 @@ class KalshiBTCIntegration:
                 # Poll up to 3 times with 200ms intervals to confirm actual fill.
                 # IOC orders fill or cancel immediately; the exchange may need
                 # a moment to settle before the query reflects the final state.
+                #
+                # Default to UNCONFIRMED: we only record a position once a real
+                # fill is observed. Recording optimistically on exhausted polls
+                # would create phantom exposure and later trigger exit orders for
+                # contracts that were never filled. Note "resting" is NOT a fill
+                # for an IOC order — it either fills or cancels.
                 fill_price = price
-                fill_quantity = Decimal(str(count))
-                confirmed_fill = True  # optimistic default
+                fill_quantity = Decimal("0")
+                confirmed_fill = False
 
                 for _poll_attempt in range(3):
                     await asyncio.sleep(0.2)  # 200ms between polls
@@ -409,18 +415,22 @@ class KalshiBTCIntegration:
                         filled_qty = order_detail.get("filled_count") or order_detail.get("filled")
                         filled_price = order_detail.get("filled_price") or order_detail.get("average_price")
 
-                        if status in ("filled", "resting", "matched"):
-                            confirmed_fill = True
+                        if status in ("filled", "matched", "partially_filled"):
                             if filled_qty is not None:
                                 fill_quantity = Decimal(str(filled_qty))
+                            elif status in ("filled", "matched"):
+                                # Fully filled but quantity not reported — fall back
+                                # to the ordered count.
+                                fill_quantity = Decimal(str(count))
                             if filled_price is not None:
                                 fill_price = Decimal(str(filled_price))
+                            confirmed_fill = fill_quantity > 0
                             logger.info(
                                 f"[LIVE] ✓ IOC fill confirmed (poll {_poll_attempt + 1}/3): order_id={order_id} "
-                                f"filled_qty={fill_quantity} filled_price={fill_price}"
+                                f"status={status} filled_qty={fill_quantity} filled_price={fill_price}"
                             )
                             break
-                        elif status in ("canceled", "cancelled", "expired"):
+                        elif status in ("canceled", "cancelled", "expired", "resting"):
                             confirmed_fill = False
                             logger.warning(
                                 f"[LIVE] ✗ IOC order not filled (status={status}, poll {_poll_attempt + 1}/3): order_id={order_id}; "
@@ -436,12 +446,22 @@ class KalshiBTCIntegration:
                     else:
                         logger.debug(f"[LIVE] Could not query order {order_id} (poll {_poll_attempt + 1}/3); retrying...")
                 else:
-                    # All 3 polls exhausted without confirmation
+                    # All 3 polls exhausted without a confirmed fill.
                     logger.warning(
                         f"[LIVE] IOC confirmation exhausted after 3 polls for order_id={order_id}; "
-                        f"recording position optimistically"
+                        f"position NOT recorded in risk engine"
                     )
-                
+
+                # Do not record a position unless a real fill was confirmed, to
+                # avoid phantom exposure / phantom exit orders.
+                if not confirmed_fill or fill_quantity <= 0:
+                    self.orders_rejected += 1
+                    logger.warning(
+                        f"[LIVE] No confirmed fill for order_id={order_id} "
+                        f"(confirmed={confirmed_fill}, qty={fill_quantity}) — not tracking position"
+                    )
+                    return None
+
                 # Store position info for tracking - will be reported via get_pending_fills()
                 # Persist client_order_id so the live-exit path (attempt_exit_position)
                 # can later locate and remove this position.

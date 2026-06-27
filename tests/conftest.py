@@ -34,7 +34,7 @@ def sample_tick_buffer():
 
 
 @pytest.fixture
-def mock_kalshi_client():
+def mock_kalshi_client() -> AsyncMock:
     """An AsyncMock that behaves like KalshiClient for integration tests.
 
     All methods return AsyncMock by default, so `await client.method()` works
@@ -82,10 +82,13 @@ def mock_kalshi_client():
         "close_time": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
     }
 
-    # get_order returns a single order dict (used by IOC fill confirmation)
+    # get_order returns a single order dict (used by IOC fill confirmation).
+    # Default to a terminal FILLED status with a real fill quantity so the
+    # success-path fixtures record a position; tests that need a canceled/
+    # resting/expired case override this per-test.
     client.get_order.return_value = {
         "order_id": "order_live_123",
-        "status": "resting",
+        "status": "filled",
         "filled_count": 2.0,
         "filled_price": 0.60,
     }
